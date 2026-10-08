@@ -142,7 +142,7 @@ enum KeychainForensicsService {
     static func exportToDocuments() -> Result<URL, Error> {
         do {
             let documents = try PatchWorkspaceService.documentsRootURL()
-            let path = try KeychainForensics.exportKeychainToDirectory(documents.path)
+            let path = try KeychainForensics.exportKeychain(toDirectory: documents.path)
             log("keychain: exported to \(path)")
             return .success(URL(fileURLWithPath: path))
         } catch {
