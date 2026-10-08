@@ -169,8 +169,12 @@ public:
     // 输入: 40 字节 wrapped key + keyclass ; 输出: 32 字节 AES 密钥
     // 二进制 0x586c44: input 指针指向 2×uint64 的 keyclass 结构
     std::vector<uint8_t> UnwrapKey(const std::vector<uint8_t>& wrapped, uint32_t keyclass) {
-        if (wrapped.size() != 0x28)
-            throw std::runtime_error("Invalid wrapped key.");
+        Log("unwrap: keyclass=" + std::to_string(keyclass) +
+            " wrappedLen=" + std::to_string(wrapped.size()));
+        if (wrapped.empty()) {
+            Log("unwrap: empty wrapped key, skipped");
+            return {};
+        }
 
         uint64_t input[2];
         input[0] = (uint64_t)(keyclass >> 24);
@@ -287,7 +291,23 @@ static std::vector<uint8_t> ProtoBytes(const uint8_t* p, const uint8_t* end, int
 
 // SecDbKeychainSerializedAKSWrappedKey { bytes wrappedKey = 1; }
 static std::vector<uint8_t> ParseWrappedKey(const std::vector<uint8_t>& blob) {
-    return ProtoBytes(blob.data(), blob.data() + blob.size(), /*field=*/1);
+    std::vector<uint8_t> field = ProtoBytes(blob.data(), blob.data() + blob.size(), /*field=*/1);
+    if (!field.empty()) return field;
+    // 回退：部分构建版本直接把 wrapped key 原样存入 data 列
+    return blob;
+}
+
+// 十六进制前缀（仅用于诊断日志）
+static std::string HexPrefix(const std::vector<uint8_t>& v, size_t maxBytes) {
+    static const char* kHex = "0123456789abcdef";
+    std::string s;
+    size_t n = v.size() < maxBytes ? v.size() : maxBytes;
+    for (size_t i = 0; i < n; i++) {
+        s += kHex[v[i] >> 4];
+        s += kHex[v[i] & 0xf];
+    }
+    if (v.size() > n) s += "...";
+    return s;
 }
 
 // =====================================================================
@@ -365,21 +385,45 @@ static DumpResult DumpKeychain(const std::string& dbPath) {
     DumpResult result;
 
     sqlite3* db = nullptr;
-    if (sqlite3_open_v2(dbPath.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK)
+    // 用 READWRITE 打开自有副本：让 SQLite 能自行恢复/checkpoint WAL。
+    // 若以 READONLY 打开 WAL 模式副本，主库与 WAL 快照不一致时会读不到表（version=0）。
+    if (sqlite3_open_v2(dbPath.c_str(), &db,
+                        SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK)
         throw std::runtime_error("Cannot open keychain database.");
+
+    // --- schema 诊断：列出所有表 ---
+    {
+        sqlite3_stmt* st = nullptr;
+        if (sqlite3_prepare_v2(db, "SELECT name FROM sqlite_master WHERE type='table'",
+                               -1, &st, nullptr) == SQLITE_OK) {
+            std::string names;
+            while (sqlite3_step(st) == SQLITE_ROW) {
+                const unsigned char* nm = sqlite3_column_text(st, 0);
+                if (nm) { names += (const char*)nm; names += " "; }
+            }
+            Log("tables: " + names);
+        } else {
+            Log(std::string("sqlite_master read failed: ") + sqlite3_errmsg(db));
+        }
+        sqlite3_finalize(st);
+    }
 
     // --- 版本判定: SELECT version FROM tversion ---
     int version = 0;
     {
         sqlite3_stmt* st = nullptr;
-        if (sqlite3_prepare_v2(db, "SELECT version FROM tversion", -1, &st, nullptr) == SQLITE_OK
-            && sqlite3_step(st) == SQLITE_ROW) {
+        int rc = sqlite3_prepare_v2(db, "SELECT version FROM tversion", -1, &st, nullptr);
+        if (rc == SQLITE_OK && sqlite3_step(st) == SQLITE_ROW)
             version = sqlite3_column_int(st, 0);
-        }
+        else
+            Log("tversion read failed: rc=" + std::to_string(rc) +
+                " err=" + sqlite3_errmsg(db));
         sqlite3_finalize(st);
     }
     if (version > 0xc)
         throw std::runtime_error("Unsupported keychain database version.");
+    if (version <= 0)
+        throw std::runtime_error("Cannot read keychain database (version 0)");
     Log("Keychain database version: " + std::to_string(version));
 
     // --- 建立 AKS 客户端 ---
@@ -388,23 +432,48 @@ static DumpResult DumpKeychain(const std::string& dbPath) {
         throw std::runtime_error("AppleKeyStore client is not available!");
 
     // --- 解包 metadatakeys: keyclass -> metadata key ---
+    // Apple 源码 (SecDbKeychainMetadataKeyStore): SELECT data, actualKeyclass FROM
+    // metadatakeys WHERE keyclass = ?，其中 actualKeyclass 才是交给 AKS 解包时使用的类。
     KeyMap metadataKeys;
     {
         sqlite3_stmt* st = nullptr;
-        sqlite3_prepare_v2(db, "SELECT keyclass, data FROM metadatakeys", -1, &st, nullptr);
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            uint32_t keyclass = (uint32_t)sqlite3_column_int(st, 0);
-            const void* blob  = sqlite3_column_blob(st, 1);
-            int n             = sqlite3_column_bytes(st, 1);
+        bool hasActual = (sqlite3_prepare_v2(db,
+                            "SELECT keyclass, actualKeyclass, data FROM metadatakeys",
+                            -1, &st, nullptr) == SQLITE_OK);
+        if (!hasActual) {
+            Log(std::string("metadatakeys: actualKeyclass unavailable (") +
+                sqlite3_errmsg(db) + "), falling back to keyclass");
+            sqlite3_prepare_v2(db, "SELECT keyclass, data FROM metadatakeys", -1, &st, nullptr);
+        }
+        while (st && sqlite3_step(st) == SQLITE_ROW) {
+            uint32_t keyclass       = (uint32_t)sqlite3_column_int(st, 0);
+            uint32_t actualKeyclass = keyclass;
+            const void* blob;
+            int n;
+            if (hasActual) {
+                actualKeyclass = (uint32_t)sqlite3_column_int(st, 1);
+                blob = sqlite3_column_blob(st, 2);
+                n    = sqlite3_column_bytes(st, 2);
+            } else {
+                blob = sqlite3_column_blob(st, 1);
+                n    = sqlite3_column_bytes(st, 1);
+            }
             if (!blob || n <= 0) continue;
 
             std::vector<uint8_t> data((const uint8_t*)blob, (const uint8_t*)blob + n);
-            std::vector<uint8_t> wrapped = ParseWrappedKey(data);            // 40 字节
-            std::vector<uint8_t> key     = aks.UnwrapKey(wrapped, keyclass); // 32 字节
+            Log("metadatakeys: keyclass=" + std::to_string(keyclass) +
+                " actualKeyclass=" + std::to_string(actualKeyclass) +
+                " dataLen=" + std::to_string(n) + " data=" + HexPrefix(data, 16));
+            std::vector<uint8_t> wrapped = ParseWrappedKey(data);
+            Log("metadatakeys: wrappedLen=" + std::to_string(wrapped.size()));
+            std::vector<uint8_t> key = aks.UnwrapKey(wrapped, actualKeyclass);
+            if (key.empty() && actualKeyclass != keyclass)
+                key = aks.UnwrapKey(wrapped, keyclass);
             if (!key.empty()) metadataKeys[keyclass] = key;
         }
         sqlite3_finalize(st);
     }
+    Log("metadatakeys: " + std::to_string(metadataKeys.size()) + " key(s) unwrapped");
 
     // --- 逐表逐行: SELECT rowid, data FROM <table> ---
     for (const char* table : kTables) {
@@ -412,9 +481,14 @@ static DumpResult DumpKeychain(const std::string& dbPath) {
         std::string sql = std::string("SELECT rowid, data FROM ") + table;
 
         sqlite3_stmt* st = nullptr;
-        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) continue;
+        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
+            Log(std::string("prepare failed for ") + table + ": " + sqlite3_errmsg(db));
+            continue;
+        }
 
+        int rowCount = 0;
         while (sqlite3_step(st) == SQLITE_ROW) {
+            rowCount++;
             int64_t rowid    = sqlite3_column_int64(st, 0);
             const void* blob = sqlite3_column_blob(st, 1);
             int n            = sqlite3_column_bytes(st, 1);
@@ -429,6 +503,8 @@ static DumpResult DumpKeychain(const std::string& dbPath) {
                 Log(std::string("decrypt failed: ") + e.what());
             }
         }
+        Log(std::string("table ") + table + ": " + std::to_string(rowCount) +
+            " row(s), " + std::to_string(result[table].size()) + " decrypted");
         sqlite3_finalize(st);
     }
 
@@ -500,9 +576,22 @@ static id KCDecodeItem(const std::vector<uint8_t>& plain) {
                                                         error:nil];
         std::string dstDir = std::string(tmpDir.UTF8String);
 
-        kc::CopyKeychainDatabase(dstDir);
-        kc::DumpResult tables = kc::DumpKeychain(dstDir + "/keychain-2.db");
-
+        // 设备上的 keychain-2.db 处于 WAL 模式且 securityd 持续写入，逐文件读取可能
+        // 得到不一致的快照（表现为 tversion 读不到、version=0）。失败时重试整个复制。
+        kc::DumpResult tables;
+        bool dumped = false;
+        for (int attempt = 1; attempt <= 4 && !dumped; attempt++) {
+            try {
+                kc::Log("copy/dump attempt " + std::to_string(attempt));
+                kc::CopyKeychainDatabase(dstDir);
+                tables = kc::DumpKeychain(dstDir + "/keychain-2.db");
+                dumped = true;
+            } catch (const std::exception& e) {
+                kc::Log(std::string("attempt ") + std::to_string(attempt) +
+                        " failed: " + e.what());
+                if (attempt == 4) throw;
+            }
+        }
         NSMutableArray *result = [NSMutableArray array];
         NSUInteger total = 0;
         for (const auto& kv : tables) {
