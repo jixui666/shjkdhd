@@ -43,7 +43,8 @@
 #include <IOKit/IOKitLib.h>
 
 // 来自 kexploit：判断沙盒逃逸是否生效（仅用于诊断日志）
-extern int sandbox_access_is_active(void);
+// sandbox_escape.m 编译为 C 链接，此处需用 extern "C" 避免 C++ 名字修饰
+extern "C" int sandbox_access_is_active(void);
 
 namespace kc {
 
