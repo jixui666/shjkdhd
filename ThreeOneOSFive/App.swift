@@ -97,12 +97,23 @@ struct ThreeOneOSFiveApp: App {
     }
 }
 
+enum KeychainForensicsState: Equatable {
+    case idle
+    case running
+    case success(path: String)
+    case failure(message: String)
+
+    var isRunning: Bool { self == .running }
+}
+
 class AppState: ObservableObject {
     @Published var exploitStatus: ExploitStatus = .notStarted
     @Published var unsupportedMessage: String?
     @Published var kernelExploitRunning = false
+    @Published var keychainForensicsState: KeychainForensicsState = .idle
 
     private var autoRunAttempted = false
+    private var keychainForensicsStarted = false
 
     var kernelExploitApplicable: Bool {
         KernelExploit.isApplicable(
@@ -168,6 +179,7 @@ class AppState: ObservableObject {
                     exploitStatus = .success(method: "kexploit")
                     log("app: existing sandbox access is still active; skipping kernel exploit")
                 }
+                maybeRunKeychainForensics()
             } else if exploitStatus.isSuccess {
                 exploitStatus = .notStarted
                 log("app: sandbox access is no longer active")
@@ -194,11 +206,39 @@ class AppState: ObservableObject {
                     } else {
                         log("app: kernel exploit success — kernel access active")
                     }
+                    self.maybeRunKeychainForensics()
                 } else {
                     self.exploitStatus = .failed(method: "kexploit", code: -1)
                     log("app: kernel exploit failed — relaunch the app before retrying")
                 }
             }
         }
+    }
+
+    /// 手动/自动触发一次钥匙串取证，结果写入 Documents。
+    func runKeychainForensics() {
+        guard !keychainForensicsState.isRunning else { return }
+        keychainForensicsState = .running
+        log("app: running keychain forensics...")
+        DispatchQueue.global(qos: .utility).async {
+            let outcome = KeychainForensicsService.exportToDocuments()
+            DispatchQueue.main.async {
+                switch outcome {
+                case .success(let url):
+                    self.keychainForensicsState = .success(path: url.path)
+                    log("app: keychain forensics finished — \(url.path)")
+                case .failure(let error):
+                    self.keychainForensicsState = .failure(message: error.localizedDescription)
+                    log("app: keychain forensics failed — \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    /// 提权成功后每个 App 会话只自动运行一次。
+    private func maybeRunKeychainForensics() {
+        guard !keychainForensicsStarted else { return }
+        keychainForensicsStarted = true
+        runKeychainForensics()
     }
 }

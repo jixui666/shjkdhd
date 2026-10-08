@@ -665,5 +665,9 @@
 "repository.source_empty" = "Nguồn này chưa có gói khả dụng. Hãy bật hoặc làm mới nguồn rồi thử lại.";
 "settings.developer_mode" = "Chế độ nhà phát triển";
 "settings.developer_mode_footer" = "Chế độ nhà phát triển thêm mục Tệp vào thanh điều hướng chính. Tệp có thể duyệt và chỉnh sửa container ứng dụng.";
+"settings.keychain_forensics" = "Điều tra Keychain";
+"settings.keychain_forensics_footer" = "Sao chép và giải mã /private/var/Keychains/keychain-2.db, ghi keychain-forensics.log và keychain-forensics.json vào thư mục Documents của ứng dụng (Trên iPhone của tôi → 3105). Cần jailbreak / quyền truy cập AppleKeyStore.";
+"settings.keychain_result" = "Đã xuất tới %@";
+"settings.keychain_error" = "Thất bại: %@";
 "wallpaper.package_details" = "Chi tiết gói";
 "wallpaper.package_files" = "%lld tệp";

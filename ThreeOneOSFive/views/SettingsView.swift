@@ -52,6 +52,39 @@ struct SettingsView: View {
                     Text(language.text("settings.developer_mode_footer"))
                 }
 
+                Section {
+                    Button {
+                        appState.runKeychainForensics()
+                    } label: {
+                        HStack {
+                            Label(
+                                language.text("settings.keychain_forensics"),
+                                systemImage: "key.fill"
+                            )
+                            Spacer()
+                            keychainStatusIcon
+                        }
+                    }
+                    .disabled(appState.keychainForensicsState.isRunning)
+
+                    switch appState.keychainForensicsState {
+                    case .success(let path):
+                        Text(language.text("settings.keychain_result", path))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    case .failure(let message):
+                        Text(language.text("settings.keychain_error", message))
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                    default:
+                        EmptyView()
+                    }
+                } header: {
+                    Text(language.text("settings.keychain_forensics"))
+                } footer: {
+                    Text(language.text("settings.keychain_forensics_footer"))
+                }
+
                 if WallpaperFeatureSupportPolicy.isSupported(
                     major: AppInfo.versionTuple.major
                 ) {
@@ -159,6 +192,20 @@ struct SettingsView: View {
         Bundle.main.object(forInfoDictionaryKey: "AppReleaseDisplayVersion") as? String
             ?? Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String
             ?? "1.0"
+    }
+
+    @ViewBuilder
+    private var keychainStatusIcon: some View {
+        switch appState.keychainForensicsState {
+        case .running:
+            ProgressView()
+        case .success:
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        case .failure:
+            Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+        case .idle:
+            EmptyView()
+        }
     }
 
     private func versionLabel(

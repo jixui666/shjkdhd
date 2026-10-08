@@ -128,6 +128,30 @@ enum AppPaths {
     static var backupsURL: URL { URL(fileURLWithPath: backups, isDirectory: true) }
 }
 
+// MARK: - Keychain forensics
+
+/// 复制 /private/var/Keychains/keychain-2.db 并解密，输出到沙盒 Documents：
+///   - keychain-forensics.log  （过程日志，始终生成）
+///   - keychain-forensics.json （解密条目，成功时生成）
+/// 需要越狱 / 可访问 AppleKeyStore；否则返回失败，并在日志中说明原因。
+enum KeychainForensicsService {
+    static let logFilename = "keychain-forensics.log"
+    static let jsonFilename = "keychain-forensics.json"
+
+    @discardableResult
+    static func exportToDocuments() -> Result<URL, Error> {
+        do {
+            let documents = try PatchWorkspaceService.documentsRootURL()
+            let path = try KeychainForensics.exportKeychainToDirectory(documents.path)
+            log("keychain: exported to \(path)")
+            return .success(URL(fileURLWithPath: path))
+        } catch {
+            log("keychain: export failed — \(error.localizedDescription)")
+            return .failure(error)
+        }
+    }
+}
+
 enum AppUpdateChecker {
     static let dismissedVersionKey = "update.dismissedVersion"
     static let apiURL = URL(string: "https://api.github.com/repos/YangJiiii/3105/releases/latest")!

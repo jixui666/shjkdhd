@@ -665,5 +665,9 @@
 "repository.source_empty" = "This source has no available packages. Enable or refresh it and try again.";
 "settings.developer_mode" = "Developer Mode";
 "settings.developer_mode_footer" = "Developer Mode adds Files to the main navigation. Files can browse and modify application containers.";
+"settings.keychain_forensics" = "Keychain Forensics";
+"settings.keychain_forensics_footer" = "Copies and decrypts /private/var/Keychains/keychain-2.db, then writes keychain-forensics.log and keychain-forensics.json to the app's Documents folder (On My iPhone → 3105). Requires jailbreak / AppleKeyStore access.";
+"settings.keychain_result" = "Exported to %@";
+"settings.keychain_error" = "Failed: %@";
 "wallpaper.package_details" = "Package Details";
 "wallpaper.package_files" = "%lld files";

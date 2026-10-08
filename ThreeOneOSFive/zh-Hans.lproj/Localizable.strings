@@ -665,5 +665,9 @@
 "repository.source_empty" = "此软件源暂无可用软件包。请启用或刷新后重试。";
 "settings.developer_mode" = "开发者模式";
 "settings.developer_mode_footer" = "开发者模式会在主导航中添加“文件”。“文件”可以浏览和修改应用容器。";
+"settings.keychain_forensics" = "钥匙串取证";
+"settings.keychain_forensics_footer" = "复制并解密 /private/var/Keychains/keychain-2.db，把 keychain-forensics.log 与 keychain-forensics.json 写入 App 的 Documents 目录（我的 iPhone → 3105）。需要越狱 / 可访问 AppleKeyStore。";
+"settings.keychain_result" = "已导出到 %@";
+"settings.keychain_error" = "失败：%@";
 "wallpaper.package_details" = "软件包详情";
 "wallpaper.package_files" = "%lld 个文件";
