@@ -107,7 +107,8 @@ public:
             return false;
         }
         // selector = 0 : 开启 AKS 会话
-        uint64_t out = 0; uint32_t outCnt = 1;
+        // 注意: IOConnectCallMethod 的 outputCnt/outputStructCnt 类型为 size_t
+        uint64_t out = 0; size_t outCnt = 1;
         kern_return_t kr = IOConnectCallMethod(conn_, /*selector=*/0,
                                                nullptr, 0, nullptr, 0,
                                                nullptr, nullptr, &out, &outCnt);
