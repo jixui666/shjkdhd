@@ -36,10 +36,14 @@
 #include <map>
 #include <stdexcept>
 
+#include <unistd.h>
 #include <sqlite3.h>
 #include <copyfile.h>
 #include <mach/mach.h>
 #include <IOKit/IOKitLib.h>
+
+// 来自 kexploit：判断沙盒逃逸是否生效（仅用于诊断日志）
+extern int sandbox_access_is_active(void);
 
 namespace kc {
 
@@ -76,14 +80,28 @@ static const char* kDbFiles[] = {
 };
 
 static void CopyKeychainDatabase(const std::string& dstDir) {
-    for (const char* f : kDbFiles) {
+    Log("copy: uid=" + std::to_string(getuid()) +
+        " euid=" + std::to_string(geteuid()) +
+        " sandbox_active=" + std::to_string(sandbox_access_is_active()));
+    const size_t count = sizeof(kDbFiles) / sizeof(kDbFiles[0]);
+    for (size_t i = 0; i < count; i++) {
+        const char* f = kDbFiles[i];
         std::string src = std::string(kSrcDir) + f;
         std::string dst = dstDir + "/" + f;
+        errno = 0;
         if (copyfile(src.c_str(), dst.c_str(), nullptr, COPYFILE_DATA) != 0) {
+            int err = errno;
+            // keychain-2.db-shm / -wal 是 WAL 辅助文件，不存在时跳过（主库仍可读）
+            if (err == ENOENT && i != 0) {
+                Log("copy: skipped missing sidecar " + src);
+                continue;
+            }
+            Log("copy failed: " + src + " -> " + dst + " errno=" + std::to_string(err) +
+                " (" + std::string(strerror(err)) + ")");
             // 原字符串: "Cannot copy keychain database to temporary folder. Error code: "
             throw std::runtime_error(
                 "Cannot copy keychain database to temporary folder. Error code: " +
-                std::to_string(errno));
+                std::to_string(err));
         }
     }
     Log("Keychain database successfully copied to " + dstDir);
