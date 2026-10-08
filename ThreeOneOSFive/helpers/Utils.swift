@@ -8,10 +8,134 @@ class AppLog: ObservableObject {
     static let shared = AppLog()
     @Published var entries: [String] = []
     func append(_ msg: String) {
+        persistAppLog(msg)
         DispatchQueue.main.async { self.entries.append(msg) }
     }
 }
 func log(_ msg: String) { AppLog.shared.append("[3105] \(msg)") }
+
+// MARK: - Persistent diagnostics (survive a crash)
+
+private let diagnosticsCrashFileName = "3105-crash.log"
+private let diagnosticsAppLogFileName = "3105-app.log"
+private let diagnosticsMaxBytes = 512 * 1024
+
+// Kept open for the whole process lifetime so the async-signal-safe crash
+// handler can write with write(2) — Foundation/NSString can deadlock there.
+private var crashLogFD: Int32 = -1
+private let crashScratch = UnsafeMutablePointer<CChar>.allocate(capacity: 512)
+private let crashFrames = UnsafeMutablePointer<UnsafeMutableRawPointer?>.allocate(capacity: 128)
+
+private let appLogQueue = DispatchQueue(label: "com.3105.applog")
+private var appLogHandle: FileHandle?
+
+private func diagnosticsDirectory() -> URL {
+    FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+        ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+}
+
+private func rotateLogIfNeeded(_ url: URL) {
+    guard let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? NSNumber,
+          size.intValue > diagnosticsMaxBytes else { return }
+    try? FileManager.default.removeItem(at: url)
+}
+
+private func writeToCrashLog(_ text: String) {
+    guard crashLogFD >= 0 else { return }
+    text.withCString { pointer in
+        var remaining = strlen(pointer)
+        var cursor = pointer
+        while remaining > 0 {
+            let written = write(crashLogFD, cursor, remaining)
+            if written <= 0 { break }
+            cursor += written
+            remaining -= written
+        }
+    }
+}
+
+// Async-signal-safe: only write(2) + backtrace_symbols_fd, no allocation/locks.
+private func crashSignalHandler(_ signo: Int32) {
+    let prefix = "\n[CRASH SIGNAL] signal="
+    var length = 0
+    for byte in prefix.utf8 {
+        crashScratch[length] = CChar(bitPattern: byte)
+        length += 1
+    }
+    var value = signo < 0 ? -signo : signo
+    let digitsStart = length
+    if value == 0 {
+        crashScratch[length] = 48
+        length += 1
+    } else {
+        while value > 0 {
+            crashScratch[length] = CChar(48 + Int(value % 10))
+            length += 1
+            value /= 10
+        }
+        var low = digitsStart
+        var high = length - 1
+        while low < high {
+            let tmp = crashScratch[low]
+            crashScratch[low] = crashScratch[high]
+            crashScratch[high] = tmp
+            low += 1
+            high -= 1
+        }
+    }
+    crashScratch[length] = 10
+    length += 1
+    _ = write(crashLogFD, crashScratch, length)
+
+    let frames = backtrace(crashFrames, Int32(128))
+    if frames > 0 { backtrace_symbols_fd(crashFrames, frames, crashLogFD) }
+    _ = write(crashLogFD, "\n", 1)
+
+    signal(signo, SIG_DFL)
+    raise(signo)
+}
+
+/// 安装未捕获异常 + 崩溃信号处理器，把崩溃原因写入 Documents/3105-crash.log。
+func setupCrashCapture() {
+    guard crashLogFD < 0 else { return }
+    let url = diagnosticsDirectory().appendingPathComponent(diagnosticsCrashFileName)
+    rotateLogIfNeeded(url)
+    crashLogFD = open(url.path, O_WRONLY | O_CREAT | O_APPEND, 0o644)
+    guard crashLogFD >= 0 else { return }
+
+    let formatter = DateFormatter()
+    formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+    writeToCrashLog("\n===== launch \(formatter.string(from: Date())) | iOS \(AppInfo.osVersion) (\(AppInfo.osBuild)) \(AppInfo.machineName) =====\n")
+
+    NSSetUncaughtExceptionHandler { exception in
+        var text = "[UNCAUGHT EXCEPTION] \(exception.name.rawValue): \(exception.reason ?? "nil")\n"
+        text += exception.callStackSymbols.joined(separator: "\n") + "\n"
+        writeToCrashLog(text)
+        fsync(crashLogFD)
+    }
+
+    for sig in [SIGABRT, SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGPIPE] {
+        signal(sig, crashSignalHandler)
+    }
+}
+
+/// 把应用内日志落盘到 Documents/3105-app.log（崩溃后仍可查看）。
+func setupPersistentAppLog() {
+    let url = diagnosticsDirectory().appendingPathComponent(diagnosticsAppLogFileName)
+    rotateLogIfNeeded(url)
+    if !FileManager.default.fileExists(atPath: url.path) {
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+    }
+    appLogHandle = try? FileHandle(forWritingTo: url)
+    _ = try? appLogHandle?.seekToEnd()
+}
+
+func persistAppLog(_ line: String) {
+    appLogQueue.async {
+        guard let handle = appLogHandle, let data = (line + "\n").data(using: .utf8) else { return }
+        try? handle.write(contentsOf: data)
+    }
+}
 
 // Retain the pipe for the app's lifetime so stdout/stderr stay redirected.
 private var logCapturePipe: Pipe?
