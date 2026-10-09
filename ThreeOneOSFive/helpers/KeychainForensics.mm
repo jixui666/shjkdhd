@@ -159,7 +159,7 @@ public:
 
         // selector = 0 : KeyBagInit（开启 AKS 会话）。
         // nabla-c0d3 在 unwrap 前调用；即使失败通常仍可继续 unwrap，故此处仅记录不致命。
-        // 注意: IOConnectCallMethod 的 outputCnt/outputStructCnt 类型为 size_t
+        // 注意: IOConnectCallMethod 的 outputCnt 为 uint32_t*，outputStructCnt 为 size_t*
         uint64_t out = 0; size_t outCnt = 1;
         kern_return_t kr = IOConnectCallMethod(conn_, /*selector=*/0,
                                                nullptr, 0, nullptr, 0,
@@ -178,7 +178,7 @@ public:
     // 返回 -1 表示调用失败。
     int64_t GetLockState() {
         uint64_t in = 0;
-        uint64_t out = 0; size_t outCnt = 1;
+        uint64_t out = 0; uint32_t outCnt = 1;   // outputCnt 参数类型为 uint32_t*
         kern_return_t kr = IOConnectCallMethod(conn_, /*selector=*/0x7,
                                                &in, 1, nullptr, 0,
                                                &out, &outCnt, nullptr, nullptr);
