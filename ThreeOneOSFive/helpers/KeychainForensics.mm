@@ -46,10 +46,6 @@
 // sandbox_escape.m 编译为 C 链接，此处需用 extern "C" 避免 C++ 名字修饰
 extern "C" int sandbox_access_is_active(void);
 
-// 来自 kexploit：提权到 root 时借用了 launchd 的 proc_ro，dump 结束前必须还原，
-// 否则进程退出时 proc_free 会按借来的只读 proc_ro 释放，导致内核 panic。
-extern "C" void sandbox_restore_root(void);
-
 // 来自 kexploit/vnode.m：通过 vnode 重定向读取无权打开的文件（如 keychain-2.db）
 // 同样编译为 C 链接，需 extern "C" 避免 C++ 名字修饰
 extern "C" int vnode_read_file_via_redirect(const char *target, const char *proxy, const char *dst);
@@ -193,36 +189,33 @@ public:
         return (int64_t)out;
     }
 
+    static bool IsUnlocked(int64_t ls) {
+        return ls == 0x4 || ls == 0x6;  // 有密码已解锁 / 无密码
+    }
+
     // 等待 keybag 解锁: lockstate 0x1(从未解锁)/0x5(有密码锁定) 视为锁定。
-    // 最多等待 timeoutSec 秒，每 0.25s 轮询一次。
+    // 最多等待 timeoutSec 秒，每 0.5s 轮询一次。
     bool WaitForUnlock(double timeoutSec) {
-        int polls = (int)(timeoutSec / 0.25) + 1;
+        int polls = (int)(timeoutSec / 0.5) + 1;
         for (int i = 0; i < polls; i++) {
             int64_t ls = GetLockState();
-            Log("keybag lockstate=" + std::to_string(ls) +
-                " (poll " + std::to_string(i) + ")");
-            if (ls == 0x4 || ls == 0x6) return true;   // 已解锁 / 无密码
-            if (ls < 0) return false;                  // 调用失败
-            usleep(250000);
+            if (i == 0 || i % 4 == 0 || IsUnlocked(ls) || ls < 0) {
+                Log("keybag lockstate=" + std::to_string(ls) +
+                    " (poll " + std::to_string(i) + ")");
+            }
+            if (IsUnlocked(ls)) return true;
+            if (ls < 0) return false;
+            usleep(500000);
         }
         return false;
     }
 
-    // 输入: 40 字节 wrapped key + keyclass ; 输出: 32 字节 AES 密钥
-    // ABI 对齐 nabla-c0d3 AppleKeyStore_keyUnwrap:
-    //   uint64_t input[2] = {0, protection_class};
-    //   outputStructCnt = bufferLen + 8;
-    std::vector<uint8_t> UnwrapKey(const std::vector<uint8_t>& wrapped, uint32_t keyclass) {
-        Log("unwrap: keyclass=" + std::to_string(keyclass) +
-            " wrappedLen=" + std::to_string(wrapped.size()));
-        if (wrapped.empty()) {
-            Log("unwrap: empty wrapped key, skipped");
-            return {};
-        }
-
-        uint64_t input[2] = {0, (uint64_t)keyclass};
-
-        std::vector<uint8_t> outStruct(wrapped.size() + 8, 0);   // 40 + 8 = 48
+    // 单次 unwrap 调用。outStructCnt = wrappedLen + 8（对齐 nabla-c0d3）。
+    std::vector<uint8_t> UnwrapKeyWithABI(const std::vector<uint8_t>& wrapped,
+                                          uint64_t in0, uint64_t in1,
+                                          const char* abiTag) {
+        uint64_t input[2] = {in0, in1};
+        std::vector<uint8_t> outStruct(wrapped.size() + 8, 0);
         size_t outStructCnt = outStruct.size();
 
         kern_return_t kr = IOConnectCallMethod(
@@ -232,15 +225,49 @@ public:
             nullptr, nullptr,
             outStruct.data(), &outStructCnt);
 
-        Log("unwrap: kr=" + std::to_string(kr) +
+        Log(std::string("unwrap[") + abiTag + "] in={" +
+            std::to_string(in0) + "," + std::to_string(in1) +
+            "} kr=" + std::to_string(kr) +
             " outStructCnt=" + std::to_string(outStructCnt));
-        if (kr != KERN_SUCCESS) {
-            Log("Device failed to unwrap key with keyclass " + std::to_string(keyclass) +
-                " err=" + std::to_string(kr));
-            return {};
-        }
+        if (kr != KERN_SUCCESS) return {};
         size_t keyLen = outStructCnt >= 32 ? 32 : outStructCnt;
         return std::vector<uint8_t>(outStruct.begin(), outStruct.begin() + keyLen);
+    }
+
+    // 输入: wrapped key + keyclass ; 输出: 32 字节 AES 密钥。
+    // 依次尝试: nabla ABI {0,kc}、legacy ABI {kc>>24,kc&0xffffff}，
+    // 并对 kc 与 kc&0xff 各试一遍（actualKeyclass 高位常带 flag）。
+    std::vector<uint8_t> UnwrapKey(const std::vector<uint8_t>& wrapped, uint32_t keyclass) {
+        Log("unwrap: keyclass=" + std::to_string(keyclass) +
+            " wrappedLen=" + std::to_string(wrapped.size()));
+        if (wrapped.empty()) {
+            Log("unwrap: empty wrapped key, skipped");
+            return {};
+        }
+
+        uint32_t classes[2];
+        int nClass = 0;
+        auto addClass = [&](uint32_t kc) {
+            for (int i = 0; i < nClass; i++) if (classes[i] == kc) return;
+            classes[nClass++] = kc;
+        };
+        addClass(keyclass);
+        addClass(keyclass & 0xff);
+
+        for (int i = 0; i < nClass; i++) {
+            uint32_t kc = classes[i];
+            auto key = UnwrapKeyWithABI(wrapped, 0, (uint64_t)kc, "nabla");
+            if (!key.empty()) return key;
+            key = UnwrapKeyWithABI(wrapped,
+                                   (uint64_t)(kc >> 24),
+                                   (uint64_t)(kc & 0xffffff),
+                                   "legacy");
+            if (!key.empty()) return key;
+        }
+
+        Log("Device failed to unwrap key with keyclass " + std::to_string(keyclass) +
+            " (all ABI/mask variants)");
+        return {};
     }
 
 private:
@@ -664,7 +691,6 @@ static id KCDecodeItem(const std::vector<uint8_t>& plain) {
         }
         kc::Log("dump finished: " + std::to_string(result.count) + " tables, " +
                 std::to_string(total) + " items");
-        sandbox_restore_root();
         kc::CloseLogFile();
         return result;
     } catch (const std::exception& e) {
@@ -675,7 +701,6 @@ static id KCDecodeItem(const std::vector<uint8_t>& plain) {
                                      userInfo:@{ NSLocalizedDescriptionKey:
                                                      [NSString stringWithUTF8String:e.what()] }];
         }
-        sandbox_restore_root();
         kc::CloseLogFile();
         return nil;
     }
