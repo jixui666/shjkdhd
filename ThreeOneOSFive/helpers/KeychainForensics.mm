@@ -46,6 +46,10 @@
 // sandbox_escape.m 编译为 C 链接，此处需用 extern "C" 避免 C++ 名字修饰
 extern "C" int sandbox_access_is_active(void);
 
+// 来自 kexploit：提权到 root 时借用了 launchd 的 proc_ro，dump 结束前必须还原，
+// 否则进程退出时 proc_free 会按借来的只读 proc_ro 释放，导致内核 panic。
+extern "C" void sandbox_restore_root(void);
+
 // 来自 kexploit/vnode.m：通过 vnode 重定向读取无权打开的文件（如 keychain-2.db）
 // 同样编译为 C 链接，需 extern "C" 避免 C++ 名字修饰
 extern "C" int vnode_read_file_via_redirect(const char *target, const char *proxy, const char *dst);
@@ -660,6 +664,7 @@ static id KCDecodeItem(const std::vector<uint8_t>& plain) {
         }
         kc::Log("dump finished: " + std::to_string(result.count) + " tables, " +
                 std::to_string(total) + " items");
+        sandbox_restore_root();
         kc::CloseLogFile();
         return result;
     } catch (const std::exception& e) {
@@ -670,6 +675,7 @@ static id KCDecodeItem(const std::vector<uint8_t>& plain) {
                                      userInfo:@{ NSLocalizedDescriptionKey:
                                                      [NSString stringWithUTF8String:e.what()] }];
         }
+        sandbox_restore_root();
         kc::CloseLogFile();
         return nil;
     }
