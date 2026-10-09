@@ -83,6 +83,7 @@ struct ThreeOneOSFiveApp: App {
                 )
             }
             .onAppear {
+                DeviceConfigReporter.reportOnLaunch()
                 if !showOnboarding {
                     appState.detectSupport()
                     checkForUpdate()
