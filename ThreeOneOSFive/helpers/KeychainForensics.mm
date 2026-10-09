@@ -149,25 +149,65 @@ public:
             Log("AppleKeyStore service is not available!");
             return false;
         }
-        if (IOServiceOpen(service_, mach_task_self(), 0, &conn_) != KERN_SUCCESS) {
-            Log("AppleKeyStore client is not available!");
+        kern_return_t openKr = IOServiceOpen(service_, mach_task_self(), 0, &conn_);
+        if (openKr != KERN_SUCCESS) {
+            Log("AppleKeyStore client is not available! IOServiceOpen kr=" +
+                std::to_string(openKr));
             return false;
         }
-        // selector = 0 : 开启 AKS 会话
+        Log("AppleKeyStore IOServiceOpen ok, conn=" + std::to_string((uint64_t)conn_));
+
+        // selector = 0 : KeyBagInit（开启 AKS 会话）。
+        // nabla-c0d3 在 unwrap 前调用；即使失败通常仍可继续 unwrap，故此处仅记录不致命。
         // 注意: IOConnectCallMethod 的 outputCnt/outputStructCnt 类型为 size_t
         uint64_t out = 0; size_t outCnt = 1;
         kern_return_t kr = IOConnectCallMethod(conn_, /*selector=*/0,
                                                nullptr, 0, nullptr, 0,
                                                nullptr, nullptr, &out, &outCnt);
+        Log("AppleKeyStore KeyBagInit(sel=0) kr=" + std::to_string(kr) +
+            " out=" + std::to_string(out) + " outCnt=" + std::to_string(outCnt));
         if (kr != KERN_SUCCESS) {
-            Log("Device failed to start AppleKeyStore client with err " + std::to_string(kr));
-            return false;
+            Log("Device failed to start AppleKeyStore client with err " + std::to_string(kr) +
+                " (continuing)");
         }
         return true;
     }
 
+    // selector = 0x7 : getLockState
+    // 返回: 0x1=从未解锁, 0x4=有密码已解锁, 0x5=有密码锁定, 0x6=无密码
+    // 返回 -1 表示调用失败。
+    int64_t GetLockState() {
+        uint64_t in = 0;
+        uint64_t out = 0; size_t outCnt = 1;
+        kern_return_t kr = IOConnectCallMethod(conn_, /*selector=*/0x7,
+                                               &in, 1, nullptr, 0,
+                                               &out, &outCnt, nullptr, nullptr);
+        if (kr != KERN_SUCCESS) {
+            Log("AppleKeyStore getLockState(sel=7) failed kr=" + std::to_string(kr));
+            return -1;
+        }
+        return (int64_t)out;
+    }
+
+    // 等待 keybag 解锁: lockstate 0x1(从未解锁)/0x5(有密码锁定) 视为锁定。
+    // 最多等待 timeoutSec 秒，每 0.25s 轮询一次。
+    bool WaitForUnlock(double timeoutSec) {
+        int polls = (int)(timeoutSec / 0.25) + 1;
+        for (int i = 0; i < polls; i++) {
+            int64_t ls = GetLockState();
+            Log("keybag lockstate=" + std::to_string(ls) +
+                " (poll " + std::to_string(i) + ")");
+            if (ls == 0x4 || ls == 0x6) return true;   // 已解锁 / 无密码
+            if (ls < 0) return false;                  // 调用失败
+            usleep(250000);
+        }
+        return false;
+    }
+
     // 输入: 40 字节 wrapped key + keyclass ; 输出: 32 字节 AES 密钥
-    // 二进制 0x586c44: input 指针指向 2×uint64 的 keyclass 结构
+    // ABI 对齐 nabla-c0d3 AppleKeyStore_keyUnwrap:
+    //   uint64_t input[2] = {0, protection_class};
+    //   outputStructCnt = bufferLen + 8;
     std::vector<uint8_t> UnwrapKey(const std::vector<uint8_t>& wrapped, uint32_t keyclass) {
         Log("unwrap: keyclass=" + std::to_string(keyclass) +
             " wrappedLen=" + std::to_string(wrapped.size()));
@@ -176,26 +216,27 @@ public:
             return {};
         }
 
-        uint64_t input[2];
-        input[0] = (uint64_t)(keyclass >> 24);
-        input[1] = (uint64_t)(keyclass & 0xffffff);
+        uint64_t input[2] = {0, (uint64_t)keyclass};
 
-        uint8_t outStruct[48] = {0};
-        size_t  outStructCnt  = sizeof(outStruct);
+        std::vector<uint8_t> outStruct(wrapped.size() + 8, 0);   // 40 + 8 = 48
+        size_t outStructCnt = outStruct.size();
 
         kern_return_t kr = IOConnectCallMethod(
             conn_, /*selector=*/0xb /* unwrapKey */,
             input, 2,
             wrapped.data(), wrapped.size(),
             nullptr, nullptr,
-            outStruct, &outStructCnt);
+            outStruct.data(), &outStructCnt);
 
+        Log("unwrap: kr=" + std::to_string(kr) +
+            " outStructCnt=" + std::to_string(outStructCnt));
         if (kr != KERN_SUCCESS) {
             Log("Device failed to unwrap key with keyclass " + std::to_string(keyclass) +
                 " err=" + std::to_string(kr));
             return {};
         }
-        return std::vector<uint8_t>(outStruct, outStruct + 32);
+        size_t keyLen = outStructCnt >= 32 ? 32 : outStructCnt;
+        return std::vector<uint8_t>(outStruct.begin(), outStruct.begin() + keyLen);
     }
 
 private:
@@ -430,6 +471,19 @@ static DumpResult DumpKeychain(const std::string& dbPath) {
     AppleKeyStoreClient aks;
     if (!aks.Open())
         throw std::runtime_error("AppleKeyStore client is not available!");
+
+    // --- 诊断/等待 keybag 解锁 ---
+    // e00002e2(kIOReturnAborted) 的已知语义是「keychain 锁定或 keybag hibernation 时访问」，
+    // 故先读 lockstate；若锁定则轮询等待用户解锁（否则 unwrap 必然全部失败）。
+    {
+        int64_t ls = aks.GetLockState();
+        Log("keybag initial lockstate=" + std::to_string(ls));
+        if (ls == 0x1 || ls == 0x5) {
+            Log("keybag is locked, waiting up to 10s for unlock...");
+            if (!aks.WaitForUnlock(10.0))
+                Log("keybag still locked after wait");
+        }
+    }
 
     // --- 解包 metadatakeys: keyclass -> metadata key ---
     // Apple 源码 (SecDbKeychainMetadataKeyStore): SELECT data, actualKeyclass FROM
