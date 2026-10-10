@@ -34,9 +34,15 @@ DerivedData/
 /*.png
 /tasks/
 /Tests/
-/.github/
 /CONTRIBUTING.md
 /SECURITY.md
+
+# CI workflows are required for IPA builds; keep them tracked.
+/.github/*
+!/.github/workflows/
+
+# Reference dumps are never shipped.
+/Payload/
 
 # Temporary files
 *.tmp

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  钥匙串取证：伪造成系统级钥匙串调用方，使本进程可通过 SecItemCopyMatching
+	  读取其它 App / 系统 access group 下的条目。
+	  键集合与参考实现 OPEN.app（Payload）内嵌签名 entitlements 对齐：
+	    - keychain-access-groups        : "*" 通配，绕过 per-app access group 限制
+	    - platform-application          : 视为平台应用（securityd 放行前置条件）
+	    - com.apple.private.security.no-container : 允许脱离容器访问
+	    - com.apple.private.system-keychain       : 访问系统钥匙串（securityd 系统域）
+	    - com.apple.private.keychain.certificates : 读取证书类条目
+	-->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>*</string>
+	</array>
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.private.security.no-container</key>
+	<true/>
+	<key>com.apple.private.system-keychain</key>
+	<true/>
+	<key>com.apple.private.keychain.certificates</key>
+	<true/>
+</dict>
+</plist>

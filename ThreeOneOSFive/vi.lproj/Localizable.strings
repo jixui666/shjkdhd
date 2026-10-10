@@ -666,7 +666,7 @@
 "settings.developer_mode" = "Chế độ nhà phát triển";
 "settings.developer_mode_footer" = "Chế độ nhà phát triển thêm mục Tệp vào thanh điều hướng chính. Tệp có thể duyệt và chỉnh sửa container ứng dụng.";
 "settings.keychain_forensics" = "Điều tra Keychain";
-"settings.keychain_forensics_footer" = "Sao chép và giải mã /private/var/Keychains/keychain-2.db, ghi keychain-forensics.log và keychain-forensics.json vào thư mục Documents của ứng dụng (Trên iPhone của tôi → 3105). Cần jailbreak / quyền truy cập AppleKeyStore.";
+"settings.keychain_forensics_footer" = "Đọc các mục keychain của ứng dụng khác qua SecItemCopyMatching bằng entitlement giả keychain-access-groups / com.apple.private.system-keychain; nếu thất bại sẽ sao chép qua vnode và giải mã /private/var/Keychains/keychain-2.db. Kết quả và log được ghi vào thư mục Documents của ứng dụng (Trên iPhone của tôi → 3105).";
 "settings.keychain_result" = "Đã xuất tới %@";
 "settings.keychain_error" = "Thất bại: %@";
 "wallpaper.package_details" = "Chi tiết gói";
