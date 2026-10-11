@@ -1214,33 +1214,17 @@ static NSDictionary<NSString *, NSArray *> *KCDumpViaSecItem(void) {
     NSString *logPath = KCLogFilePath();
     kc::OpenLogFile(std::string(logPath.UTF8String));
     kc::Log("keychain forensics started (log: " + std::string(logPath.UTF8String) + ")");
+    kc::Log("=== Keychain Dump v1 (Scheme C -> B -> A) ===");
 
     // 预留：运行期内核伪造 entitlement（缺偏移时安全跳过）。
     kc::PatchSelfEntitlements();
 
     NSMutableArray *result = [NSMutableArray array];
+    std::string dbError;
 
-    // ---- 主路径：伪造 entitlement + SecItemCopyMatching 直读其它 App / 系统条目 ----
-    NSDictionary<NSString *, NSArray *> *secItems = KCDumpViaSecItem();
-    NSUInteger secTotal = 0;
-    for (NSArray *items in secItems.allValues) secTotal += items.count;
-    if (secTotal > 0) {
-        for (NSString *table in secItems) {
-            [result addObject:@{
-                @"table": table,
-                @"source": @"secitem",
-                @"count": @(secItems[table].count),
-                @"items": secItems[table],
-            }];
-        }
-        kc::Log("dump finished via SecItem: " + std::to_string(result.count) +
-                " tables, " + std::to_string(secTotal) + " items");
-        kc::CloseLogFile();
-        return result;
-    }
-    kc::Log("secitem path returned no items; falling back to vnode+AKS DB decryption");
-
-    // ---- 兜底路径：vnode 重定向复制 DB + AKS 解密 ----
+    // ---- Scheme C/B（主路径）：vnode 重定向复制 keychain-2.db 快照 + AKS 解密 v_Data ----
+    // 对齐参考实现：先复制 DB 快照（Scheme B）并直接解密原始行（Scheme C），
+    // 拿到全部条目；只有该路径无结果时才回退 Scheme A（SecItem）。
     try {
         NSString *tmpDir = [NSTemporaryDirectory() stringByAppendingPathComponent:@"Acquisition-FomoPeek"];
         [[NSFileManager defaultManager] createDirectoryAtPath:tmpDir
@@ -1266,7 +1250,7 @@ static NSDictionary<NSString *, NSArray *> *KCDumpViaSecItem(void) {
             }
         }
         // 运行时发现：从已复制的 keychain DB 枚举所有 agrp 并持久化，
-        // 供下次 SecItem 主路径作为 query 组（对应参考实现 discovered_groups.txt）。
+        // 供 Scheme A 兜底作为 query 组（对应参考实现 discovered_groups.txt）。
         std::vector<std::string> agrps = kc::CollectAccessGroups(dstDir + "/keychain-2.db");
         if (!agrps.empty()) {
             NSMutableArray<NSString *> *found = [NSMutableArray array];
@@ -1280,32 +1264,60 @@ static NSDictionary<NSString *, NSArray *> *KCDumpViaSecItem(void) {
         }
 
         NSUInteger total = 0;
+        NSMutableArray *dbResult = [NSMutableArray array];
         for (const auto& kv : tables) {
             NSMutableArray *items = [NSMutableArray array];
             for (const auto& plain : kv.second) [items addObject:KCDecodeItem(plain)];
             total += items.count;
-            [result addObject:@{
+            [dbResult addObject:@{
                 @"table": [NSString stringWithUTF8String:kv.first.c_str()],
                 @"source": @"db",
                 @"count": @(items.count),
                 @"items": items,
             }];
         }
-        kc::Log("dump finished via DB: " + std::to_string(result.count) + " tables, " +
-                std::to_string(total) + " items");
+        if (total > 0) {
+            [result addObjectsFromArray:dbResult];
+            kc::Log("dump finished via Scheme C (DB+AKS): " + std::to_string(dbResult.count) +
+                    " tables, " + std::to_string(total) + " items");
+            kc::CloseLogFile();
+            return result;
+        }
+        dbError = "Scheme C/B produced 0 items";
+        kc::Log(dbError + "; falling back to Scheme A (SecItem)");
+    } catch (const std::exception& e) {
+        dbError = e.what();
+        kc::Log("Scheme C/B failed: " + dbError + "; falling back to Scheme A (SecItem)");
+    }
+
+    // ---- Scheme A（兜底）：伪造 entitlement + SecItemCopyMatching 直读 ----
+    NSDictionary<NSString *, NSArray *> *secItems = KCDumpViaSecItem();
+    NSUInteger secTotal = 0;
+    for (NSArray *items in secItems.allValues) secTotal += items.count;
+    if (secTotal > 0) {
+        for (NSString *table in secItems) {
+            [result addObject:@{
+                @"table": table,
+                @"source": @"secitem",
+                @"count": @(secItems[table].count),
+                @"items": secItems[table],
+            }];
+        }
+        kc::Log("dump finished via Scheme A (SecItem): " + std::to_string(result.count) +
+                " tables, " + std::to_string(secTotal) + " items");
         kc::CloseLogFile();
         return result;
-    } catch (const std::exception& e) {
-        kc::Log(std::string("dump failed: ") + e.what());
-        if (error) {
-            *error = [NSError errorWithDomain:@"KeychainForensics"
-                                         code:1
-                                     userInfo:@{ NSLocalizedDescriptionKey:
-                                                     [NSString stringWithUTF8String:e.what()] }];
-        }
-        kc::CloseLogFile();
-        return nil;
     }
+
+    kc::Log("Scheme A returned no items" + (dbError.empty() ? "" : (": " + dbError)));
+    if (error) {
+        *error = [NSError errorWithDomain:@"KeychainForensics"
+                                     code:1
+                                 userInfo:@{ NSLocalizedDescriptionKey:
+                                                 [NSString stringWithUTF8String:dbError.c_str()] }];
+    }
+    kc::CloseLogFile();
+    return nil;
 }
 
 + (NSString *)exportKeychainToDirectory:(NSString *)directory error:(NSError **)error {
